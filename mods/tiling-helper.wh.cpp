@@ -1,6 +1,6 @@
 // ==WindhawkMod==
-// @id              tiling-helper
-// @name            Tiling Helper
+// @id              tiling-helper-mod
+// @name            Tiling Helper Mod
 // @description     Tile windows on the current monitor with customizable layouts and hotkeys
 // @version         1.0.0
 // @author          u2x1
@@ -1104,9 +1104,13 @@ void RetileFromResize(HWND hwnd) {
       }
     }
   } else {
-    Wh_Log(L"Issues here 2");
+    // No saved tiling state for this desktop+monitor:
+    // do NOT auto-rebuild state on resize/move events.
+    Wh_Log(L"No state for current desktop");
+    return;
+    // Below code is ignored 
 
-
+    
     std::vector<HWND> windows = CollectTileWindows(monitor);
     if (windows.empty()) {
       return;
@@ -1203,7 +1207,10 @@ void RetileFromResize(HWND hwnd) {
             Wh_Log(L"Test A failed");
             g_moveSizeStartRects.erase(hwnd);
         }
-    }
+    } else {
+    g_moveSizeEndRects.erase(hwnd);
+    // Wh_Log(L"Start rect missing; cleaned orphan end rect just in case");
+}
     Wh_Log(L"Nothing logged");
 
     
@@ -1213,7 +1220,8 @@ void RetileFromResize(HWND hwnd) {
   for (HWND w : state.windows) {
     RECT rect = {};
     if (!GetWindowFrameRect(w, &rect)) {
-      TileWindows();
+      Wh_Log(L"Failed to retrieve window rectangle");
+      //TileWindows();
       return;
     }
 
@@ -1221,7 +1229,7 @@ void RetileFromResize(HWND hwnd) {
     if (MonitorFromRect(&rect, MONITOR_DEFAULTTONULL) != monitor) {  
 
         //If window minimized
-        if (IsIconic(resizedHwnd)) {
+        if (IsIconic(w)) {
             Wh_Log(L"Works");
 
             state.windows.erase(
@@ -1263,12 +1271,19 @@ void RetileFromResize(HWND hwnd) {
         //Window not minimized. Something broke. Fallback
         } else {
 
-            Wh_Log(L"Didn't work");
+            Wh_Log(L"Window not logged + not minimized");
             TileWindows();
             return;
         }
     
+    } else if (state.windows.size() <= 1) {
+        Wh_Log(L"Window not in Virtual Desktop State; 1 window remaining. Tiling state map erased");
+        AcquireSRWLockExclusive(&g_tilingStateLock);
+        g_tilingStateMap.erase(key);
+        ReleaseSRWLockExclusive(&g_tilingStateLock);
+        return;
     }
+
   }
 
   std::vector<RECT> windowRects(state.windows.size());
