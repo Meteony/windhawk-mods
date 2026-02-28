@@ -612,7 +612,6 @@ TilingState BuildStateFromWindows(TileLayout layout, const RECT& workArea, const
 }
 
 std::vector<LONG> ComputeWeightedSizes(LONG totalSize, LONG gap, const std::vector<double>& weights) {
-  //Wh_Log(L"Weighed Sizes");
   size_t count = weights.size();
   std::vector<LONG> sizes(count, 0);
   if (count == 0) return sizes;
@@ -1088,25 +1087,22 @@ void RetileFromResize(HWND hwnd) {
 
   HWND resizedHwnd = hwnd;
 
-
-  
-    //Does the current desktop have saved "state" or not? 
   if (hasState) {
     if (!ContainsWindow(state.windows, resizedHwnd)) {
       HWND resolved = ResolveToTiledWindow(resizedHwnd, state.windows);
       if (resolved) {
-        // Patch: Makes it so that a window from another desktop (not found in "state" doesn't trigger retile)
-        
+        // Makes it so that a window from another desktop (not found in "state" doesn't trigger retile)
         resizedHwnd = resolved; return;
+
       } else {
-        Wh_Log(L"Issues here 1");
+        Wh_Log(L"Unresolved window");
         return;
       }
     }
   } else {
     // No saved tiling state for this desktop+monitor:
-    // do NOT auto-rebuild state on resize/move events.
-    Wh_Log(L"No state for current desktop");
+    // do not auto-rebuild state on resize/move events.
+    Wh_Log(L"No known state for current desktop");
     return;
     // Below code is ignored 
 
@@ -1143,10 +1139,8 @@ void RetileFromResize(HWND hwnd) {
   }
 
 
-  Wh_Log(L"Start skipping");
-
-  //Mouse "pop" section
-  //Look up resized window for cached states to see whether it was moved or not. 
+  // Mouse un-tile functionality
+  // Compares cached window states 
   auto itStart = g_moveSizeStartRects.find(hwnd);
   if (itStart != g_moveSizeStartRects.end()) {
       const RECT& before = itStart->second;
@@ -1157,14 +1151,12 @@ void RetileFromResize(HWND hwnd) {
 
           RectChange change = ClassifyRectChange(before, after, 1);
 
-          // Clean up cache entries first (safe and simple)
+          // Clean up cache entries first 
           g_moveSizeStartRects.erase(hwnd);
           g_moveSizeEndRects.erase(hwnd);
 
 
           if (change == RectChange::MoveOnly) {
-              // This is where we pop a window out of the grid
-              Wh_Log(L"Skipped successfully");
               state.windows.erase(
               std::remove(state.windows.begin(), state.windows.end(), resizedHwnd),
               state.windows.end()
@@ -1181,7 +1173,7 @@ void RetileFromResize(HWND hwnd) {
               else if (state.windows.size() == 1){
                   state.masterRatio = ClampDouble(g_masterPercent / 100.0, 0.1, 0.9);
 
-                  // If you already have workArea here, force the last window to fill it
+                  // If already have workArea here, force the last window to fill it
                   PlaceWindow(state.windows[0], workArea);
                   // Persist updated state
                   AcquireSRWLockExclusive(&g_tilingStateLock);
@@ -1205,14 +1197,13 @@ void RetileFromResize(HWND hwnd) {
 
       } else {
           // No end rect cached, clean up start just in case
-          Wh_Log(L"Test A failed");
+          Wh_Log(L"End rect missing; cleaned up start rect");
           g_moveSizeStartRects.erase(hwnd);
       }
   } else {
   g_moveSizeEndRects.erase(hwnd);
-  // Wh_Log(L"Start rect missing; cleaned orphan end rect (in state cache) just in case");
+  //Wh_Log(L"Start rect missing; cleaned orphan end rect (in state cache) just in case");
   }
-  Wh_Log(L"Nothing logged");
 
     
   //Cleanup pass to remove stale windows before retile
@@ -1251,15 +1242,14 @@ void RetileFromResize(HWND hwnd) {
       RECT rect{};
       if (!GetWindowFrameRect(w, &rect)) {
           Wh_Log(L"Failed to retrieve window rectangle (post-cleanup), removing stale window");
-          itWin = state.windows.erase(itWin);   // erase returns next iterator
+          itWin = state.windows.erase(itWin);   // returning next iterator
           continue;
       }
 
       if (MonitorFromRect(&rect, MONITOR_DEFAULTTONULL) != monitor) {
           if (IsIconic(w)) {
-              Wh_Log(L"Window left monitor because it is minimized; removing from state");
-              itWin = state.windows.erase(itWin);  // erase *w*, not resizedHwnd
-
+              Wh_Log(L"Window left monitor (minimized); removing from state");
+              itWin = state.windows.erase(itWin); 
               if (state.windows.empty()) {
                   AcquireSRWLockExclusive(&g_tilingStateLock);
                   g_tilingStateMap.erase(key);
@@ -1285,7 +1275,7 @@ void RetileFromResize(HWND hwnd) {
 
               continue;
           } else {
-              Wh_Log(L"Window not on monitor and not minimized; fallback retile");
+              Wh_Log(L"Window not on monitor && not minimized; retile as fallback");
               TileWindows();
               return;
           }
@@ -1495,19 +1485,17 @@ void OnWindowResizeEnd(HWND hwnd) {
 
 void CALLBACK WinEventProc(HWINEVENTHOOK, DWORD event, HWND hwnd, LONG idObject, LONG idChild, DWORD, DWORD) {
     if (((event != EVENT_SYSTEM_MOVESIZESTART)&&(event != EVENT_SYSTEM_MOVESIZEEND))&&(event != EVENT_SYSTEM_MINIMIZESTART)) return;
-  Wh_Log(L"Hooked");
+    //Wh_Log(L"Hook");
 
     if (event == EVENT_SYSTEM_MOVESIZESTART) {
-        Wh_Log(L"Seg 3");
-
+        //Wh_Log(L"EVENT_SYSTEM_MOVESIZESTART");
         RECT r{};
         if (GetWindowFrameRect(hwnd, &r)) {
         g_moveSizeStartRects[hwnd] = r;
         }
     }
     else if (event == EVENT_SYSTEM_MOVESIZEEND) {
-            Wh_Log(L"Seg 4");
-
+        //Wh_Log(L"EVENT_SYSTEM_MOVESIZEEND");
         RECT r{};
         if (GetWindowFrameRect(hwnd, &r)) {
         g_moveSizeEndRects[hwnd] = r;
