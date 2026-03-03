@@ -273,6 +273,8 @@ struct TilingState {
 static std::unordered_map<DesktopMonitorKey, TilingState, DesktopMonitorKeyHash, DesktopMonitorKeyEqual>
     g_tilingStateMap;
 static SRWLOCK g_tilingStateLock = SRWLOCK_INIT;
+//Rect cache thread safety lock
+static SRWLOCK g_moveSizeRectsLock = SRWLOCK_INIT;
 static volatile LONG g_retileInProgress = 0;
 static HWINEVENTHOOK g_hMoveSizeHook = nullptr;
 static HWINEVENTHOOK g_hMinimizeHook = nullptr;
@@ -648,41 +650,67 @@ std::vector<LONG> ComputeWeightedSizes(LONG totalSize, LONG gap, const std::vect
   return sizes;
 }
 
-std::vector<LONG> ComputeWeightedSizesWithFixed(LONG totalSize, LONG gap, const std::vector<double>& weights,
-                                                size_t fixedIndex, LONG fixedSize) {
-  size_t count = weights.size();
+std::vector<LONG> ComputeWeightedSizesWithFixed(
+    LONG totalSize, LONG gap, const std::vector<double>& weights,
+    size_t fixedIndex, LONG fixedSize) {
+
+  const size_t count = weights.size();
   std::vector<LONG> sizes(count, 0);
   if (count == 0) return sizes;
   if (fixedIndex >= count) return ComputeWeightedSizes(totalSize, gap, weights);
 
-  LONG available = totalSize - gap * (LONG)(count - 1);
+  const LONG available = totalSize - gap * (LONG)(count - 1);
   if (available <= 0) return sizes;
 
-  LONG minFixed = 1;
-  LONG maxFixed = available - (LONG)(count - 1);
-  if (maxFixed < 1) maxFixed = 1;
-  if (fixedSize < minFixed) fixedSize = minFixed;
-  if (fixedSize > maxFixed) fixedSize = maxFixed;
+  // Clamp fixed size so remaining windows can still be >=1
+  const LONG minFixed = 1;
+  const LONG maxFixed = std::max<LONG>(1, available - (LONG)(count - 1));
+  fixedSize = std::clamp(fixedSize, minFixed, maxFixed);
+
+  sizes[fixedIndex] = fixedSize;
 
   LONG remaining = available - fixedSize;
+  if (count == 1) return sizes;
 
-  std::vector<double> otherWeights;
-  otherWeights.reserve(count - 1);
+  // Sum weights for non-fixed slots
+  double sum = 0.0;
   for (size_t i = 0; i < count; ++i) {
     if (i == fixedIndex) continue;
-    otherWeights.push_back(weights[i]);
+    sum += (weights[i] > 0.0 ? weights[i] : 1.0);
   }
+  if (sum <= 0.0) sum = (double)(count - 1);
 
-  std::vector<LONG> otherSizes = ComputeWeightedSizes(remaining, gap, otherWeights);
+  LONG used = 0;
+  double remainingSum = sum;
 
-  size_t otherIndex = 0;
+  // Distribute remaining across non-fixed indices (no gap math here)
   for (size_t i = 0; i < count; ++i) {
-    if (i == fixedIndex) {
-      sizes[i] = fixedSize;
+    if (i == fixedIndex) continue;
+
+    // how many non-fixed slots remain after i?
+    LONG slotsLeft = 0;
+    for (size_t j = i + 1; j < count; ++j) if (j != fixedIndex) ++slotsLeft;
+
+    double w = (weights[i] > 0.0 ? weights[i] : 1.0);
+    LONG size = 0;
+
+    if (slotsLeft == 0) {
+      size = remaining - used;
     } else {
-      sizes[i] = otherSizes[otherIndex++];
+      const double ratio = w / remainingSum;
+      size = (LONG)std::llround((double)(remaining - used) * ratio);
+      if (size < 1) size = 1;
+
+      const LONG maxSize = (remaining - used) - slotsLeft; // leave >=1 for each remaining slot
+      if (size > maxSize) size = maxSize;
     }
+
+    sizes[i] = size;
+    used += size;
+    remainingSum -= w;
+    if (remainingSum <= 0.0) remainingSum = 1.0;
   }
+
   return sizes;
 }
 
@@ -1141,8 +1169,10 @@ void RetileFromResize(HWND hwnd) {
 
   // Mouse un-tile functionality
   // Compares cached window states 
+  AcquireSRWLockExclusive(&g_moveSizeRectsLock);
   auto itStart = g_moveSizeStartRects.find(hwnd);
   if (itStart != g_moveSizeStartRects.end()) {
+      
       const RECT& before = itStart->second;
 
       auto itEnd = g_moveSizeEndRects.find(hwnd);
@@ -1152,9 +1182,10 @@ void RetileFromResize(HWND hwnd) {
           RectChange change = ClassifyRectChange(before, after, 1);
 
           // Clean up cache entries first 
+
           g_moveSizeStartRects.erase(hwnd);
           g_moveSizeEndRects.erase(hwnd);
-
+          ReleaseSRWLockExclusive(&g_moveSizeRectsLock);
 
           if (change == RectChange::MoveOnly) {
               state.windows.erase(
@@ -1199,9 +1230,11 @@ void RetileFromResize(HWND hwnd) {
           // No end rect cached, clean up start just in case
           Wh_Log(L"End rect missing; cleaned up start rect");
           g_moveSizeStartRects.erase(hwnd);
+          ReleaseSRWLockExclusive(&g_moveSizeRectsLock);
       }
   } else {
   g_moveSizeEndRects.erase(hwnd);
+  ReleaseSRWLockExclusive(&g_moveSizeRectsLock);
   //Wh_Log(L"Start rect missing; cleaned orphan end rect (in state cache) just in case");
   }
 
@@ -1484,23 +1517,26 @@ void OnWindowResizeEnd(HWND hwnd) {
 }
 
 void CALLBACK WinEventProc(HWINEVENTHOOK, DWORD event, HWND hwnd, LONG idObject, LONG idChild, DWORD, DWORD) {
-    if (((event != EVENT_SYSTEM_MOVESIZESTART)&&(event != EVENT_SYSTEM_MOVESIZEEND))&&(event != EVENT_SYSTEM_MINIMIZESTART)) return;
-    //Wh_Log(L"Hook");
-    //will add thread protection later
-    if (event == EVENT_SYSTEM_MOVESIZESTART) {
-        //Wh_Log(L"EVENT_SYSTEM_MOVESIZESTART");
-        RECT r{};
-        if (GetWindowFrameRect(hwnd, &r)) {
-        g_moveSizeStartRects[hwnd] = r;
-        }
-    }
-    else if (event == EVENT_SYSTEM_MOVESIZEEND) {
-        //Wh_Log(L"EVENT_SYSTEM_MOVESIZEEND");
-        RECT r{};
-        if (GetWindowFrameRect(hwnd, &r)) {
-        g_moveSizeEndRects[hwnd] = r;
-        }
-    }
+  
+  if (((event != EVENT_SYSTEM_MOVESIZESTART)&&(event != EVENT_SYSTEM_MOVESIZEEND))&&(event != EVENT_SYSTEM_MINIMIZESTART)) return;
+  if (idObject != OBJID_WINDOW || idChild != CHILDID_SELF || !hwnd) return;
+
+  AcquireSRWLockExclusive(&g_moveSizeRectsLock);
+  if (event == EVENT_SYSTEM_MOVESIZESTART) {
+      //Wh_Log(L"EVENT_SYSTEM_MOVESIZESTART");
+      RECT r{};
+      if (GetWindowFrameRect(hwnd, &r)) {
+      g_moveSizeStartRects[hwnd] = r;
+      }
+  }
+  else if (event == EVENT_SYSTEM_MOVESIZEEND) {
+      //Wh_Log(L"EVENT_SYSTEM_MOVESIZEEND");
+      RECT r{};
+      if (GetWindowFrameRect(hwnd, &r)) {
+      g_moveSizeEndRects[hwnd] = r;
+      }
+  }
+  ReleaseSRWLockExclusive(&g_moveSizeRectsLock);
 
   if (idObject != OBJID_WINDOW || idChild != CHILDID_SELF) return;
   if (!hwnd) return;
@@ -1512,24 +1548,18 @@ void CALLBACK WinEventProc(HWINEVENTHOOK, DWORD event, HWND hwnd, LONG idObject,
 }
 
 void InstallMoveSizeHook() {
-    if (!g_hMoveSizeHook) {
-            g_hMoveSizeHook = SetWinEventHook(
-                EVENT_SYSTEM_MOVESIZESTART, EVENT_SYSTEM_MOVESIZEEND,
-                nullptr, WinEventProc, 0, 0,
-                WINEVENT_OUTOFCONTEXT | WINEVENT_SKIPOWNPROCESS);
-        }
+  if (!g_hMoveSizeHook) {
+    g_hMoveSizeHook = SetWinEventHook(EVENT_SYSTEM_MOVESIZESTART, EVENT_SYSTEM_MOVESIZEEND,
+                                      nullptr, WinEventProc, 0, 0,
+                                      WINEVENT_OUTOFCONTEXT | WINEVENT_SKIPOWNPROCESS);
+    if (!g_hMoveSizeHook) Wh_Log(L"Failed to install move/size hook");
+  }
 
-        if (!g_hMinimizeHook) {
-            g_hMinimizeHook = SetWinEventHook(
-                EVENT_SYSTEM_MINIMIZESTART, EVENT_SYSTEM_MINIMIZEEND,
-                nullptr, WinEventProc, 0, 0,
-                WINEVENT_OUTOFCONTEXT | WINEVENT_SKIPOWNPROCESS);
-        }  if (!g_hMoveSizeHook) {
-    if (!g_hMoveSizeHook){
-        Wh_Log(L"Failed to install move/size hook");}
-    if (!g_hMinimizeHook){
-        Wh_Log(L"Failed to install minimization hook");}
-
+  if (!g_hMinimizeHook) {
+    g_hMinimizeHook = SetWinEventHook(EVENT_SYSTEM_MINIMIZESTART, EVENT_SYSTEM_MINIMIZEEND,
+                                      nullptr, WinEventProc, 0, 0,
+                                      WINEVENT_OUTOFCONTEXT | WINEVENT_SKIPOWNPROCESS);
+    if (!g_hMinimizeHook) Wh_Log(L"Failed to install minimization hook");
   }
 }
 
