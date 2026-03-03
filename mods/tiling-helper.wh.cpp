@@ -1486,7 +1486,7 @@ void OnWindowResizeEnd(HWND hwnd) {
 void CALLBACK WinEventProc(HWINEVENTHOOK, DWORD event, HWND hwnd, LONG idObject, LONG idChild, DWORD, DWORD) {
     if (((event != EVENT_SYSTEM_MOVESIZESTART)&&(event != EVENT_SYSTEM_MOVESIZEEND))&&(event != EVENT_SYSTEM_MINIMIZESTART)) return;
     //Wh_Log(L"Hook");
-
+    //will add thread protection later
     if (event == EVENT_SYSTEM_MOVESIZESTART) {
         //Wh_Log(L"EVENT_SYSTEM_MOVESIZESTART");
         RECT r{};
