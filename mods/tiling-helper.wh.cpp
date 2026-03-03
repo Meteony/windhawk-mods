@@ -60,6 +60,10 @@ resize-adjusted ratios per virtual desktop.
   $name: '[Tiling] Retile Toggle Key'
   $description: 'Key to pause/resume retile-on-resize and reset tiling memory. Only active when Retile On Resize is enabled.'
 
+- SwapMasterKey: "M"
+  $name: '[Tiling] Switch Master Window Key'
+  $description: 'Key to set another master window. Only active when Retile On Resize is enabled.'
+
 - CaptureLayoutOnTile: true
   $name: '[Tiling] Capture Layout On Tile'
   $description: Use current window sizes as layout weights when tiling (useful when auto-retile is disabled)
@@ -206,13 +210,15 @@ static volatile bool g_stopHotkeyThread = false;
 enum HotkeyIds {
   HK_TILE = 1,
   HK_LAYOUT = 2,
-  HK_RETILE_TOGGLE = 3
+  HK_RETILE_TOGGLE = 3,
+  HK_SWAP_MASTER = 4
 };
 
 static UINT g_tilingModifiers = MOD_ALT;
 static UINT g_tileKey = 'D';
 static UINT g_layoutKey = 'L';
 static UINT g_retileToggleKey = 'R';
+static UINT g_swapMasterKey = 'M';
 
 static LONG g_tileMargin = 4;
 static LONG g_tileGap = 4;
@@ -1647,6 +1653,7 @@ void LoadSettings() {
   g_tileKey = ReadStringSetting(L"TileKey", ParseSingleCharKey, (UINT)'D');
   g_layoutKey = ReadStringSetting(L"LayoutKey", ParseSingleCharKey, (UINT)'L');
   g_retileToggleKey = ReadStringSetting(L"RetileToggleKey", ParseSingleCharKey, (UINT)'R');
+  g_swapMasterKey = ReadStringSetting(L"SwapMasterKey", ParseSingleCharKey, (UINT)'M');
 }
 
 DWORD WINAPI HotkeyThreadProc(LPVOID) {
@@ -1666,6 +1673,7 @@ DWORD WINAPI HotkeyThreadProc(LPVOID) {
 
   if (g_enableTiling) {
     RegisterHotKey(nullptr, HK_TILE, g_tilingModifiers, g_tileKey);
+    RegisterHotKey(nullptr, HK_SWAP_MASTER, g_tilingModifiers, g_swapMasterKey);
     if (g_enableLayoutCycle) {
       RegisterHotKey(nullptr, HK_LAYOUT, g_tilingModifiers, g_layoutKey);
     }
@@ -1701,6 +1709,83 @@ DWORD WINAPI HotkeyThreadProc(LPVOID) {
             TileWindows();
             continue;
           }
+        if (hotkeyId == HK_SWAP_MASTER) {
+        HWND fg = GetForegroundWindow();
+        if (!fg) continue;
+
+        HMONITOR mon = MonitorFromWindow(fg, MONITOR_DEFAULTTONULL);
+        if (!mon) continue;
+
+        RECT monWork{};
+        if (!GetMonitorWorkArea(mon, &monWork)) continue;
+
+        RECT workArea = {monWork.left + g_tileMargin, monWork.top + g_tileMargin,
+                        monWork.right - g_tileMargin, monWork.bottom - g_tileMargin};
+        if (workArea.right <= workArea.left || workArea.bottom <= workArea.top) continue;
+
+        GUID desktopId{};
+
+        if (!GetWindowDesktopIdSafe(fg, &desktopId)) {
+            continue;
+        }
+
+        DesktopMonitorKey key{desktopId, mon};
+
+        // Avoid racing with resize-retile
+        if (InterlockedCompareExchange(&g_retileInProgress, 1, 0) != 0) continue;
+
+        TilingState stCopy;
+        {
+            AcquireSRWLockExclusive(&g_tilingStateLock);
+
+            auto it = g_tilingStateMap.find(key);
+            if (it == g_tilingStateMap.end() || it->second.windows.empty()) {
+            ReleaseSRWLockExclusive(&g_tilingStateLock);
+            InterlockedExchange(&g_retileInProgress, 0);
+            continue;
+            }
+
+            TilingState& st = it->second;
+
+            HWND resolved = ResolveToTiledWindow(fg, st.windows);
+            if (!resolved) {
+            ReleaseSRWLockExclusive(&g_tilingStateLock);
+            InterlockedExchange(&g_retileInProgress, 0);
+            continue;
+            }
+
+            size_t idx = (size_t)-1;
+            for (size_t i = 0; i < st.windows.size(); ++i) {
+            if (st.windows[i] == resolved) { idx = i; break; }
+            }
+            if (idx == (size_t)-1 || idx == 0) {
+            ReleaseSRWLockExclusive(&g_tilingStateLock);
+            InterlockedExchange(&g_retileInProgress, 0);
+            continue;
+            }
+
+            // Swap windows: resolved becomes "master" (index 0)
+            std::swap(st.windows[0], st.windows[idx]);
+            
+
+
+            /*
+            if ((st.layout == TileLayout::Columns || st.layout == TileLayout::Rows) &&
+                st.gridWeights.size() == st.windows.size()) {
+            std::swap(st.gridWeights[0], st.gridWeights[idx]);
+            }
+            */
+
+
+            // Still need to figure out how to retile cleanly while preserving slots
+            // Swapping windows already makes the selected window take the master area
+            stCopy = st; // copy out & release lock before moving windows
+            ReleaseSRWLockExclusive(&g_tilingStateLock);
+            RetileFromResize(resolved); 
+        }
+        InterlockedExchange(&g_retileInProgress, 0);
+        continue;
+        }                 
           if (hotkeyId == HK_RETILE_TOGGLE && g_enableResizeRetile) {
             g_retileSuspended = !g_retileSuspended;
             if (g_retileSuspended) {
@@ -1722,6 +1807,7 @@ DWORD WINAPI HotkeyThreadProc(LPVOID) {
 cleanup:
   if (g_enableTiling) {
     UnregisterHotKey(nullptr, HK_TILE);
+    UnregisterHotKey(nullptr, HK_SWAP_MASTER);
     if (g_enableLayoutCycle) {
       UnregisterHotKey(nullptr, HK_LAYOUT);
     }
