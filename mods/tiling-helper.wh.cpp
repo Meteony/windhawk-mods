@@ -970,6 +970,83 @@ void PlaceWindow(HWND hwnd, const RECT& targetRect) {
                SWP_NOZORDER | SWP_NOOWNERZORDER | SWP_NOACTIVATE | SWP_NOSENDCHANGING | SWP_ASYNCWINDOWPOS);
 }
 
+void SwapMaster() {
+  HWND fg = GetForegroundWindow();
+  if (!fg) return;
+
+  HMONITOR mon = MonitorFromWindow(fg, MONITOR_DEFAULTTONULL);
+  if (!mon) return;
+
+  GUID desktopId{};
+  if (!GetWindowDesktopIdSafe(fg, &desktopId)) return;
+
+  DesktopMonitorKey key{desktopId, mon};
+
+  // Avoid racing with resize-retile
+  if (InterlockedCompareExchange(&g_retileInProgress, 1, 0) != 0) return;
+
+  bool didSwap  = false;
+  HWND oldMaster = nullptr;
+  HWND resolved  = nullptr;
+  RECT rMaster{}, rResolved{};
+  bool lockHeld {false};
+
+  // ---- critical section (state mutation) ----
+  AcquireSRWLockExclusive(&g_tilingStateLock);
+  lockHeld = true;
+
+  {
+    auto it = g_tilingStateMap.find(key);
+    if (it == g_tilingStateMap.end() || it->second.windows.size() < 2) goto swap_cleanup;
+
+    TilingState& st = it->second;
+
+    resolved = ResolveToTiledWindow(fg, st.windows);
+    if (!resolved) goto swap_cleanup;
+
+    size_t idx = (size_t)-1;
+    for (size_t i = 0; i < st.windows.size(); ++i) {
+      if (st.windows[i] == resolved) { idx = i; break; }
+    }
+    if (idx == (size_t)-1 || idx == 0) goto swap_cleanup;
+
+    oldMaster = st.windows[0];
+
+    // Capture current slot rects (frame bounds)
+    if (!GetWindowFrameRect(oldMaster, &rMaster)) goto swap_cleanup;
+    if (!GetWindowFrameRect(resolved,  &rResolved)) goto swap_cleanup;
+
+    // Persist slot swap
+    std::swap(st.windows[0], st.windows[idx]);
+    didSwap = true;
+  }
+
+swap_cleanup:
+  if (lockHeld) {
+    ReleaseSRWLockExclusive(&g_tilingStateLock);
+    lockHeld = false;
+  }
+
+  // Apply swap visually (keep g_retileInProgress=1 while moving to suppress event-triggered retiling)
+  if (didSwap) {
+    PlaceWindow(oldMaster, rResolved);
+    PlaceWindow(resolved,  rMaster);
+
+    // cleaning up rect caches just in case. 
+    // don't think it's necessary tho
+    AcquireSRWLockExclusive(&g_moveSizeRectsLock);
+    g_moveSizeStartRects.erase(oldMaster);
+    g_moveSizeEndRects.erase(oldMaster);
+    g_moveSizeStartRects.erase(resolved);
+    g_moveSizeEndRects.erase(resolved);
+    ReleaseSRWLockExclusive(&g_moveSizeRectsLock);
+
+  }
+
+  InterlockedExchange(&g_retileInProgress, 0);
+  return;
+}
+
 void TileWindows() {
   HWND foregroundWindow = GetForegroundWindow();
   HMONITOR monitor = foregroundWindow ? MonitorFromWindow(foregroundWindow, MONITOR_DEFAULTTONULL) : nullptr;
@@ -1709,83 +1786,10 @@ DWORD WINAPI HotkeyThreadProc(LPVOID) {
             TileWindows();
             continue;
           }
-        if (hotkeyId == HK_SWAP_MASTER) {
-        HWND fg = GetForegroundWindow();
-        if (!fg) continue;
-
-        HMONITOR mon = MonitorFromWindow(fg, MONITOR_DEFAULTTONULL);
-        if (!mon) continue;
-
-        RECT monWork{};
-        if (!GetMonitorWorkArea(mon, &monWork)) continue;
-
-        RECT workArea = {monWork.left + g_tileMargin, monWork.top + g_tileMargin,
-                        monWork.right - g_tileMargin, monWork.bottom - g_tileMargin};
-        if (workArea.right <= workArea.left || workArea.bottom <= workArea.top) continue;
-
-        GUID desktopId{};
-
-        if (!GetWindowDesktopIdSafe(fg, &desktopId)) {
+          if (hotkeyId == HK_SWAP_MASTER) {
+            SwapMaster();
             continue;
-        }
-
-        DesktopMonitorKey key{desktopId, mon};
-
-        // Avoid racing with resize-retile
-        if (InterlockedCompareExchange(&g_retileInProgress, 1, 0) != 0) continue;
-
-        TilingState stCopy;
-        {
-            AcquireSRWLockExclusive(&g_tilingStateLock);
-
-            auto it = g_tilingStateMap.find(key);
-            if (it == g_tilingStateMap.end() || it->second.windows.empty()) {
-            ReleaseSRWLockExclusive(&g_tilingStateLock);
-            InterlockedExchange(&g_retileInProgress, 0);
-            continue;
-            }
-
-            TilingState& st = it->second;
-
-            HWND resolved = ResolveToTiledWindow(fg, st.windows);
-            if (!resolved) {
-            ReleaseSRWLockExclusive(&g_tilingStateLock);
-            InterlockedExchange(&g_retileInProgress, 0);
-            continue;
-            }
-
-            size_t idx = (size_t)-1;
-            for (size_t i = 0; i < st.windows.size(); ++i) {
-            if (st.windows[i] == resolved) { idx = i; break; }
-            }
-            if (idx == (size_t)-1 || idx == 0) {
-            ReleaseSRWLockExclusive(&g_tilingStateLock);
-            InterlockedExchange(&g_retileInProgress, 0);
-            continue;
-            }
-
-            // Swap windows: resolved becomes "master" (index 0)
-            std::swap(st.windows[0], st.windows[idx]);
-            
-
-
-            /*
-            if ((st.layout == TileLayout::Columns || st.layout == TileLayout::Rows) &&
-                st.gridWeights.size() == st.windows.size()) {
-            std::swap(st.gridWeights[0], st.gridWeights[idx]);
-            }
-            */
-
-
-            // Still need to figure out how to retile cleanly while preserving slots
-            // Swapping windows already makes the selected window take the master area
-            stCopy = st; // copy out & release lock before moving windows
-            ReleaseSRWLockExclusive(&g_tilingStateLock);
-            RetileFromResize(resolved); 
-        }
-        InterlockedExchange(&g_retileInProgress, 0);
-        continue;
-        }                 
+          }
           if (hotkeyId == HK_RETILE_TOGGLE && g_enableResizeRetile) {
             g_retileSuspended = !g_retileSuspended;
             if (g_retileSuspended) {
