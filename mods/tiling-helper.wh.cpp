@@ -1159,6 +1159,31 @@ void TileWindows() {
   Wh_Log(L"Tiled %zu windows with layout %d", windows.size(), static_cast<int>(layout));
 }
 
+
+// used as helper of HandleTrivialState()
+static void EraseState(const DesktopMonitorKey & key){
+  AcquireSRWLockExclusive(&g_tilingStateLock);
+  g_tilingStateMap.erase(key);
+  ReleaseSRWLockExclusive(&g_tilingStateLock);
+}
+
+// true: handled "<=1 windows in TilingState" case; false otherwise
+// returns "true": caller should (probably) also return
+static bool HandleTrivialState(const DesktopMonitorKey & key, TilingState & state, const RECT & workArea){
+  if (state.windows.empty()){
+    EraseState(key);
+    return true;
+  }
+
+  else if (state.windows.size() == 1){
+    PlaceWindow(state.windows[0], workArea);
+    EraseState(key);
+    return true;
+  }
+
+  return false;
+}
+
 void RetileFromResize(HWND hwnd) {
   if (!g_enableTiling || !IsWindow(hwnd)) {
     return;
@@ -1213,28 +1238,25 @@ void RetileFromResize(HWND hwnd) {
   } else {
     // No saved tiling state for this desktop+monitor:
     // do not auto-rebuild state on resize/move events.
-    Wh_Log(L"No known state for current desktop");
+    Wh_Log(L"Tiling not set up for current desktop");
     return;
-    // Below code is ignored 
 
-    
+    // Below code is disabled for now to emulate windows default multitasking behavior. 
+    // Can be reused if a tileOnDefault setting is added. 
+  
     std::vector<HWND> windows = CollectTileWindows(monitor);
     if (windows.empty()) {
       return;
     }
 
     if (!ContainsWindow(windows, resizedHwnd)) {
-
-
       HWND resolved = ResolveToTiledWindow(resizedHwnd, windows);
       if (resolved) {
         resizedHwnd = resolved;
       } else {
         return;
-      }
-      
-    // Auto-retile really shouldn't do anything if theres no state for this desktop. This fallback is extremely unnecessary
-    return; 
+      }  
+      return; 
     }
 
     TileLayout layout = g_currentLayout;
@@ -1242,15 +1264,12 @@ void RetileFromResize(HWND hwnd) {
     state.layout = layout;
     hasState = true;
 
-    
   }
 
-  if (state.windows.empty()) {
-    return;
-  }
+  // checks for dead state
+  if (HandleTrivialState(key, state, workArea)) return;
 
-
-  // Mouse un-tile functionality
+  // Un-tile functionality
   // Compares cached window states 
   AcquireSRWLockExclusive(&g_moveSizeRectsLock);
   auto itStart = g_moveSizeStartRects.find(hwnd);
@@ -1276,41 +1295,16 @@ void RetileFromResize(HWND hwnd) {
               state.windows.end()
               );
 
-              //Cleanup if no windows
-              if (state.windows.empty()) {
-                  AcquireSRWLockExclusive(&g_tilingStateLock);
-                  g_tilingStateMap.erase(key);
-                  ReleaseSRWLockExclusive(&g_tilingStateLock);
-                  return;
-              }
-              
-              else if (state.windows.size() == 1){
-                  state.masterRatio = ClampDouble(g_masterPercent / 100.0, 0.1, 0.9);
-
-                  // If already have workArea here, force the last window to fill it
-                  PlaceWindow(state.windows[0], workArea);
-                  // Persist updated state
-                  AcquireSRWLockExclusive(&g_tilingStateLock);
-                  
-                  // Reset everything in state before writing back
-                  state.layout = g_currentLayout;
-                  state.windows.clear();
-                  state.stackWeights.clear();
-                  state.gridWeights.clear();
-                  g_tilingStateMap[key] = state;
-                  ReleaseSRWLockExclusive(&g_tilingStateLock);
-                  return;
-              };
+              // handles trivial state
+              if (HandleTrivialState(key, state, workArea)) return;
 
               AcquireSRWLockExclusive(&g_tilingStateLock);
               g_tilingStateMap[key] = state;
               ReleaseSRWLockExclusive(&g_tilingStateLock);
               
-              //return;
           }
 
       } else {
-          // No end rect cached, clean up start just in case
           Wh_Log(L"End rect missing; cleaned up start rect");
           g_moveSizeStartRects.erase(hwnd);
           ReleaseSRWLockExclusive(&g_moveSizeRectsLock);
@@ -1318,7 +1312,7 @@ void RetileFromResize(HWND hwnd) {
   } else {
   g_moveSizeEndRects.erase(hwnd);
   ReleaseSRWLockExclusive(&g_moveSizeRectsLock);
-  //Wh_Log(L"Start rect missing; cleaned orphan end rect (in state cache) just in case");
+  Wh_Log(L"Start rect missing; cleaned end rect cache");
   }
 
     
@@ -1330,28 +1324,11 @@ void RetileFromResize(HWND hwnd) {
             return !IsWindow(w) || !GetWindowFrameRect(w, &r);
         }),
     state.windows.end());
-  if (state.windows.empty()) {
-      AcquireSRWLockExclusive(&g_tilingStateLock);
-      g_tilingStateMap.erase(key);
-      ReleaseSRWLockExclusive(&g_tilingStateLock);
-      return;
-  }
-  if (state.windows.size() == 1) {
-      PlaceWindow(state.windows[0], workArea);
 
-      // Clear state (treat single-window as "not tiled")
-      AcquireSRWLockExclusive(&g_tilingStateLock);
-      state.layout = g_currentLayout;
-      state.windows.clear();
-      state.stackWeights.clear();
-      state.gridWeights.clear();
-      g_tilingStateMap[key] = state;
-      ReleaseSRWLockExclusive(&g_tilingStateLock);
-      return;
-  }
+  if (HandleTrivialState(key, state, workArea)) return;
+
 
   //Start looping over state to place all windows
-  //Switched to an iterator loop due to having to erase within the loop
   for (auto itWin = state.windows.begin(); itWin != state.windows.end(); ) {
       HWND w = *itWin;
 
@@ -1366,21 +1343,8 @@ void RetileFromResize(HWND hwnd) {
           if (IsIconic(w)) {
               Wh_Log(L"Window left monitor (minimized); removing from state");
               itWin = state.windows.erase(itWin); 
-              if (state.windows.empty()) {
-                  AcquireSRWLockExclusive(&g_tilingStateLock);
-                  g_tilingStateMap.erase(key);
-                  ReleaseSRWLockExclusive(&g_tilingStateLock);
-                  return;
-              }
 
-              if (state.windows.size() == 1) {
-                  PlaceWindow(state.windows[0], workArea);
-
-                  AcquireSRWLockExclusive(&g_tilingStateLock);
-                  g_tilingStateMap.erase(key);  // better than storing empty state
-                  ReleaseSRWLockExclusive(&g_tilingStateLock);
-                  return;
-              }
+              if (HandleTrivialState(key, state, workArea)) return;
 
               // If the resized target was removed, retarget
               if (w == resizedHwnd || !ContainsWindow(state.windows, resizedHwnd)) {
@@ -1399,6 +1363,7 @@ void RetileFromResize(HWND hwnd) {
 
       ++itWin; // only increment when not erasing
   }
+  
   std::vector<RECT> windowRects(state.windows.size());
 
   constexpr LONG kMinRetileSpan = 80; 
