@@ -1227,8 +1227,9 @@ void RetileFromResize(HWND hwnd) {
     if (!ContainsWindow(state.windows, resizedHwnd)) {
       HWND resolved = ResolveToTiledWindow(resizedHwnd, state.windows);
       if (resolved) {
-        // Makes it so that a window from another desktop (not found in "state" doesn't trigger retile)
-        resizedHwnd = resolved; return;
+        resizedHwnd = resolved; 
+        // (intentional) early return to not handle windows from another desktop
+        return;
 
       } else {
         Wh_Log(L"Unresolved window");
@@ -1726,7 +1727,7 @@ DWORD WINAPI HotkeyThreadProc(LPVOID) {
   Wh_Log(L"Hotkeys registered");
 
   while (!g_stopHotkeyThread) {
-    DWORD waitResult = MsgWaitForMultipleObjects(0, nullptr, FALSE, 100, QS_ALLINPUT);
+    DWORD waitResult = MsgWaitForMultipleObjects(0, nullptr, FALSE, INFINITE, QS_ALLINPUT);
 
     if (waitResult == WAIT_OBJECT_0) {
       while (PeekMessage(&msg, nullptr, 0, 0, PM_REMOVE)) {
