@@ -1744,7 +1744,7 @@ void LoadSettings() {
   g_captureLayoutOnTile = Wh_GetIntSetting(L"CaptureLayoutOnTile") != 0;
   g_enableLayoutCycle = Wh_GetIntSetting(L"EnableLayoutCycle") != 0;
   // New! 
-  g_enableTileNewWin = Wh_GetIntSetting(L"EnableTIleNewWin") != 0;
+  g_enableTileNewWin = Wh_GetIntSetting(L"EnableTileNewWin") != 0;
   g_retileSuspended = false;
 
 
