@@ -1671,7 +1671,7 @@ void RemoveWinEventHooks() {
     }
     if (g_hCreateDestroyHook) {
         UnhookWinEvent(g_hCreateDestroyHook);
-        g_hMinimizeHook = nullptr;
+        g_hCreateDestroyHook = nullptr;
     }
 }
 
