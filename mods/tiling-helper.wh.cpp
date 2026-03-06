@@ -52,6 +52,10 @@ resize-adjusted ratios per virtual desktop.
   $name: '[Tiling] Enable'
   $description: Enable hotkey to tile windows on current monitor
 
+- EnableTileNewWin: false
+  $name: '[Tiling] Tile New Windows'
+  $description: Automatically retile when a new window is created (only applies when tiling is enabled)
+
 - EnableResizeRetile: true
   $name: '[Tiling] Retile On Resize'
   $description: Automatically retile when a tiled window is resized (only applies when tiling is enabled)
@@ -232,6 +236,7 @@ static bool g_enableResizeRetile = true;
 static bool g_captureLayoutOnTile = true;
 static bool g_enableLayoutCycle = true;
 static bool g_retileSuspended = false;
+static bool g_enableTileNewWin = false;
 
 // Per-desktop + monitor state
 struct GuidHash {
@@ -284,6 +289,7 @@ static SRWLOCK g_moveSizeRectsLock = SRWLOCK_INIT;
 static volatile LONG g_retileInProgress = 0;
 static HWINEVENTHOOK g_hMoveSizeHook = nullptr;
 static HWINEVENTHOOK g_hMinimizeHook = nullptr;
+static HWINEVENTHOOK g_hCreateDestroyHook = nullptr;
 
 //=============================================================================
 //Cache Rects
@@ -1567,36 +1573,69 @@ void OnWindowResizeEnd(HWND hwnd) {
 
 void CALLBACK WinEventProc(HWINEVENTHOOK, DWORD event, HWND hwnd, LONG idObject, LONG idChild, DWORD, DWORD) {
   
-  if (((event != EVENT_SYSTEM_MOVESIZESTART)&&(event != EVENT_SYSTEM_MOVESIZEEND))&&(event != EVENT_SYSTEM_MINIMIZESTART)) return;
-  if (idObject != OBJID_WINDOW || idChild != CHILDID_SELF || !hwnd) return;
-
-  AcquireSRWLockExclusive(&g_moveSizeRectsLock);
-  if (event == EVENT_SYSTEM_MOVESIZESTART) {
-      //Wh_Log(L"EVENT_SYSTEM_MOVESIZESTART");
-      RECT r{};
-      if (GetWindowFrameRect(hwnd, &r)) {
-      g_moveSizeStartRects[hwnd] = r;
-      }
+  switch (event) {
+    case EVENT_SYSTEM_MOVESIZESTART:
+    case EVENT_SYSTEM_MOVESIZEEND:
+    case EVENT_SYSTEM_MINIMIZESTART:
+    case EVENT_SYSTEM_MINIMIZEEND:
+    case EVENT_OBJECT_CREATE:
+    case EVENT_OBJECT_DESTROY:
+      break;
+    default:
+      return;
   }
-  else if (event == EVENT_SYSTEM_MOVESIZEEND) {
-      //Wh_Log(L"EVENT_SYSTEM_MOVESIZEEND");
-      RECT r{};
-      if (GetWindowFrameRect(hwnd, &r)) {
-      g_moveSizeEndRects[hwnd] = r;
-      }
-  }
-  ReleaseSRWLockExclusive(&g_moveSizeRectsLock);
 
-  if (idObject != OBJID_WINDOW || idChild != CHILDID_SELF) return;
-  if (!hwnd) return;
-  
-  if (event == EVENT_SYSTEM_MOVESIZEEND || event == EVENT_SYSTEM_MINIMIZESTART) 
-    //if (event == EVENT_SYSTEM_MINIMIZESTART) {RetileFromResize(hwnd);return;};
+  // For window-level events only.
+  if (!hwnd || idObject != OBJID_WINDOW || idChild != CHILDID_SELF) {
+    return;
+  }
+
+  // Cache start/end rects for move/size events.
+  if (event == EVENT_SYSTEM_MOVESIZESTART || event == EVENT_SYSTEM_MOVESIZEEND) {
+    AcquireSRWLockExclusive(&g_moveSizeRectsLock);
+
+    RECT r{};
+    if (GetWindowFrameRect(hwnd, &r)) {
+      if (event == EVENT_SYSTEM_MOVESIZESTART) {
+        g_moveSizeStartRects[hwnd] = r;
+      } else { // MOVESIZEEND
+        g_moveSizeEndRects[hwnd] = r;
+      }
+    }
+
+    ReleaseSRWLockExclusive(&g_moveSizeRectsLock);
+
+    if (event == EVENT_SYSTEM_MOVESIZEEND) {
+      OnWindowResizeEnd(hwnd);
+    }
+    return;
+  }
+
+  // Minimize start: treat like "resize end" for auto-retile behavior.
+  if (event == EVENT_SYSTEM_MINIMIZESTART) {
     OnWindowResizeEnd(hwnd);
+    return;
+  }
+
+  /*
+  //Add destroy handeling here!!!
+  //Update: doesn't work. HWND goes stale. 
+  if (event == EVENT_OBJECT_DESTROY) {
+    OnWindowResizeEnd(hwnd);
+    return;
+  }
+  */
+
+  // Handle window creation / restoration
+  if ((event == EVENT_OBJECT_CREATE || 
+  event == EVENT_SYSTEM_MINIMIZEEND) 
+  && g_enableTileNewWin
+  ) 
+    TileWindows();
   return;
 }
 
-void InstallMoveSizeHook() {
+void InstallWinEventHooks() {
   if (!g_hMoveSizeHook) {
     g_hMoveSizeHook = SetWinEventHook(EVENT_SYSTEM_MOVESIZESTART, EVENT_SYSTEM_MOVESIZEEND,
                                       nullptr, WinEventProc, 0, 0,
@@ -1610,15 +1649,28 @@ void InstallMoveSizeHook() {
                                       WINEVENT_OUTOFCONTEXT | WINEVENT_SKIPOWNPROCESS);
     if (!g_hMinimizeHook) Wh_Log(L"Failed to install minimization hook");
   }
+
+  if (!g_hCreateDestroyHook) {
+    g_hCreateDestroyHook = SetWinEventHook(
+      EVENT_OBJECT_CREATE, EVENT_OBJECT_DESTROY,
+      nullptr, WinEventProc, 0, 0,
+      WINEVENT_OUTOFCONTEXT | WINEVENT_SKIPOWNPROCESS
+    );
+    if (!g_hCreateDestroyHook) Wh_Log(L"Failed to install create/destroy hook");
+  }
 }
 
-void RemoveMoveSizeHook() {
+void RemoveWinEventHooks() {
     if (g_hMoveSizeHook) {
         UnhookWinEvent(g_hMoveSizeHook);
         g_hMoveSizeHook = nullptr;
     }
     if (g_hMinimizeHook) {
         UnhookWinEvent(g_hMinimizeHook);
+        g_hMinimizeHook = nullptr;
+    }
+    if (g_hCreateDestroyHook) {
+        UnhookWinEvent(g_hCreateDestroyHook);
         g_hMinimizeHook = nullptr;
     }
 }
@@ -1691,7 +1743,10 @@ void LoadSettings() {
   g_enableResizeRetile = Wh_GetIntSetting(L"EnableResizeRetile") != 0;
   g_captureLayoutOnTile = Wh_GetIntSetting(L"CaptureLayoutOnTile") != 0;
   g_enableLayoutCycle = Wh_GetIntSetting(L"EnableLayoutCycle") != 0;
+  // New! 
+  g_enableTileNewWin = Wh_GetIntSetting(L"EnableTIleNewWin") != 0;
   g_retileSuspended = false;
+
 
   g_tileKey = ReadStringSetting(L"TileKey", ParseSingleCharKey, (UINT)'D');
   g_layoutKey = ReadStringSetting(L"LayoutKey", ParseSingleCharKey, (UINT)'L');
@@ -1711,7 +1766,7 @@ DWORD WINAPI HotkeyThreadProc(LPVOID) {
   SetEvent(g_hReadyEvent);
 
   if (g_enableTiling && g_enableResizeRetile && !g_retileSuspended) {
-    InstallMoveSizeHook();
+    InstallWinEventHooks();
   }
 
   if (g_enableTiling) {
@@ -1725,6 +1780,12 @@ DWORD WINAPI HotkeyThreadProc(LPVOID) {
     }
   }
   Wh_Log(L"Hotkeys registered");
+
+
+  if (g_enableTileNewWin) {
+    TileWindows();
+    Wh_Log(L"TileNewWin Enabled: Tiled current workplace on startup");
+  }
 
   while (!g_stopHotkeyThread) {
     DWORD waitResult = MsgWaitForMultipleObjects(0, nullptr, FALSE, INFINITE, QS_ALLINPUT);
@@ -1759,12 +1820,12 @@ DWORD WINAPI HotkeyThreadProc(LPVOID) {
           if (hotkeyId == HK_RETILE_TOGGLE && g_enableResizeRetile) {
             g_retileSuspended = !g_retileSuspended;
             if (g_retileSuspended) {
-              RemoveMoveSizeHook();
+              RemoveWinEventHooks();
               InterlockedExchange(&g_retileInProgress, 0);
               ResetTilingStateMemory();
               Wh_Log(L"Retile-on-resize suspended; tiling memory reset");
             } else {
-              InstallMoveSizeHook();
+              InstallWinEventHooks();
               Wh_Log(L"Retile-on-resize resumed");
             }
             continue;
@@ -1786,7 +1847,7 @@ cleanup:
     }
   }
 
-  RemoveMoveSizeHook();
+  RemoveWinEventHooks();
 
   CleanupVirtualDesktopAPI();
   CoUninitialize();
