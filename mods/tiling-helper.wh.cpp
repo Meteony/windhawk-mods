@@ -1198,7 +1198,8 @@ static HWND PruneDestroyedAndPickAnchor(HWND deadHwnd) {
 
   HMONITOR curMon = fg ? MonitorFromWindow(fg, MONITOR_DEFAULTTONULL) : nullptr;
   if (!curMon) {
-    POINT p{}; GetCursorPos(&p);
+    POINT p{};
+    if (!GetCursorPos(&p)) p = POINT{0, 0};
     curMon = MonitorFromPoint(p, MONITOR_DEFAULTTONEAREST);
   }
 
@@ -1894,8 +1895,11 @@ DWORD WINAPI HotkeyThreadProc(LPVOID) {
 
 
   if (g_enableTileNewWin) {
-    TileWindows();
-    Wh_Log(L"TileNewWin Enabled: Tiled current workplace on startup");
+      if (InterlockedCompareExchange(&g_retileInProgress, 1, 0) == 0) {
+        TileWindows();
+        InterlockedExchange(&g_retileInProgress, 0);
+      }
+      Wh_Log(L"TileNewWin Enabled: Tiled current workplace on startup");
   }
 
   while (!g_stopHotkeyThread) {
@@ -1929,14 +1933,20 @@ DWORD WINAPI HotkeyThreadProc(LPVOID) {
         if (msg.message == WM_HOTKEY) {
           UINT hotkeyId = static_cast<UINT>(msg.wParam);
           if (hotkeyId == HK_TILE) {
-            TileWindows();
-            continue;
+              if (InterlockedCompareExchange(&g_retileInProgress, 1, 0) == 0) {
+                TileWindows();
+                InterlockedExchange(&g_retileInProgress, 0);
+              }
+              continue;
           }
           if (hotkeyId == HK_LAYOUT) {
             g_currentLayout =
                 static_cast<TileLayout>((static_cast<int>(g_currentLayout) + 1) % static_cast<int>(TileLayout::COUNT));
-            TileWindows();
-            continue;
+              if (InterlockedCompareExchange(&g_retileInProgress, 1, 0) == 0) {
+                TileWindows();
+                InterlockedExchange(&g_retileInProgress, 0);
+              }
+              continue;
           }
           if (hotkeyId == HK_SWAP_MASTER) {
             SwapMaster();
