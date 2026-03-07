@@ -1176,6 +1176,11 @@ static HWND PruneDestroyedAndPickAnchor(HWND deadHwnd) {
   HWND fg = GetForegroundWindow();
   HWND anchor = nullptr;
 
+  // Really don't want dead HWNDs to be there
+  AcquireSRWLockExclusive(&g_moveSizeRectsLock);
+  g_moveSizeStartRects.erase(deadHwnd);
+  g_moveSizeEndRects.erase(deadHwnd);
+  ReleaseSRWLockExclusive(&g_moveSizeRectsLock);
 
   // Obtains current desktopID
   // "Well ackually since curDesk is a GUID we can't just set it to a null value and check for it later..." 
@@ -1233,7 +1238,14 @@ static HWND PruneDestroyedAndPickAnchor(HWND deadHwnd) {
           if (w && IsWindow(w) && !IsIconic(w)) { anchor = w; break; }
         }
       }
-    }
+      // If all windows are minimized somehow: 
+      // skip minimiization check to at least return an anchor
+      if (!anchor) {
+        for (HWND w : st.windows) {
+          if (w && IsWindow(w)) { anchor = w; break; }
+        }
+      }
+  }
 
     ++it;
   }
@@ -1649,6 +1661,7 @@ void OnWindowResizeEnd(HWND hwnd) {
 
 
 static void RequestTileWindows() {
+  if (!g_enableTiling || g_retileSuspended) return;
   if (!g_threadId) return;
 
   // Reuse existing guards
@@ -1660,6 +1673,7 @@ static void RequestTileWindows() {
 } 
 
 static void RequestPruneDestroyed(HWND dead) {
+  if (!g_enableTiling || g_retileSuspended) return;
   if (!dead) return;
   if (!g_threadId) return;
   if (InterlockedCompareExchange(&g_retileInProgress, 1, 0) != 0) return;
@@ -1862,7 +1876,7 @@ DWORD WINAPI HotkeyThreadProc(LPVOID) {
   PeekMessage(&msg, nullptr, 0, 0, PM_NOREMOVE);
   SetEvent(g_hReadyEvent);
 
-  if (g_enableTiling && g_enableResizeRetile && !g_retileSuspended) {
+  if (g_enableTiling && !g_retileSuspended && (g_enableResizeRetile || g_enableTileNewWin)) {
     InstallWinEventHooks();
   }
 
