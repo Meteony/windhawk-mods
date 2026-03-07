@@ -552,6 +552,33 @@ TilingState BuildStateFromWindows(TileLayout layout, const RECT& workArea, const
       infos.push_back({w, rect});
     }
 
+
+    // choose master by "closest to 3 workarea edges" score
+    std::vector<std::pair<long long, size_t>> candidates;
+    candidates.reserve(infos.size());
+
+    for (size_t i = 0; i < infos.size(); ++i) {
+      const RECT& r = infos[i].rect;
+
+      long long d[4] = {
+        (long long)std::llabs((long long)r.left   - (long long)workArea.left),
+        (long long)std::llabs((long long)r.top    - (long long)workArea.top),
+        (long long)std::llabs((long long)r.right  - (long long)workArea.right),
+        (long long)std::llabs((long long)r.bottom - (long long)workArea.bottom),
+      };
+
+      std::sort(d, d + 4);
+      long long score = d[0] + d[1] + d[2]; // "distance from being master"
+      candidates.emplace_back(score, i);
+    }
+
+    std::stable_sort(candidates.begin(), candidates.end(),
+      [](const auto& a, const auto& b) { return a.first < b.first; });
+
+    size_t masterIndex = candidates.empty() ? 0 : candidates.front().second;
+
+    // old logic uses maximum sizes
+    /*
     size_t masterIndex = 0;
     LONG bestSize = -1;
     for (size_t i = 0; i < infos.size(); ++i) {
@@ -561,6 +588,7 @@ TilingState BuildStateFromWindows(TileLayout layout, const RECT& workArea, const
         masterIndex = i;
       }
     }
+    */
 
     WindowInfo master = infos[masterIndex];
     std::vector<WindowInfo> stack;
@@ -570,7 +598,7 @@ TilingState BuildStateFromWindows(TileLayout layout, const RECT& workArea, const
       stack.push_back(infos[i]);
     }
 
-    std::sort(stack.begin(), stack.end(), [horizontal](const WindowInfo& a, const WindowInfo& b) {
+    std::stable_sort(stack.begin(), stack.end(), [horizontal](const WindowInfo& a, const WindowInfo& b) {
       return horizontal ? (a.rect.left < b.rect.left) : (a.rect.top < b.rect.top);
     });
 
@@ -612,7 +640,7 @@ TilingState BuildStateFromWindows(TileLayout layout, const RECT& workArea, const
       infos.push_back({w, rect});
     }
 
-    std::sort(infos.begin(), infos.end(), [horizontal](const WindowInfo& a, const WindowInfo& b) {
+    std::stable_sort(infos.begin(), infos.end(), [horizontal](const WindowInfo& a, const WindowInfo& b) {
       return horizontal ? (a.rect.top < b.rect.top) : (a.rect.left < b.rect.left);
     });
 
@@ -1080,6 +1108,25 @@ swap_cleanup:
   return;
 }
 
+
+// Small helpers for TileWindows()
+static inline long long RectAreaLL(const RECT& r) {
+  long long w = (long long)r.right - (long long)r.left;
+  long long h = (long long)r.bottom - (long long)r.top;
+  if (w <= 0 || h <= 0) return 0;
+  return w * h;
+}
+// Also helper for TileWindows()
+static inline long long WindowAreaOnWorkArea(HWND hwnd, const RECT& workArea) {
+  RECT r{};
+  if (!GetWindowFrameRect(hwnd, &r)) return 0;
+
+  RECT inter{};
+  if (!IntersectRect(&inter, &r, &workArea)) return 0;
+
+  return RectAreaLL(inter);
+}
+
 void TileWindows() {
   HWND foregroundWindow = GetForegroundWindow();
   HMONITOR monitor = foregroundWindow ? MonitorFromWindow(foregroundWindow, MONITOR_DEFAULTTONULL) : nullptr;
@@ -1113,17 +1160,52 @@ void TileWindows() {
   std::vector<double> stackWeights;
   std::vector<double> gridWeights;
 
+
+  // below section builds state from windows
   bool usedCaptured = false;
-  if (g_captureLayoutOnTile) {
+
+  // determine whether a saved state already exists for this desktop+monitor
+  bool hasSavedStateForKey = false;
+  if (hasDesktopId) {
+    AcquireSRWLockShared(&g_tilingStateLock);
+    hasSavedStateForKey = (g_tilingStateMap.find(key) != g_tilingStateMap.end());
+    ReleaseSRWLockShared(&g_tilingStateLock);
+  }
+
+  // decide if capture is allowed on first-time state creation
+  // simply put: (do windows look tiled enough) ? capture layout : use defaults
+  bool allowCapture = g_captureLayoutOnTile;
+  if (allowCapture && hasDesktopId && !hasSavedStateForKey) {
+    const long long workAreaArea = RectAreaLL(workArea);
+
+    long long sumArea = 0;
+    for (HWND w : windows) {
+      sumArea += WindowAreaOnWorkArea(w, workArea);
+    }
+
+    // if NOT within ±15% of workArea coverage, skip capture
+    // (sumArea is overlap-sensitive on purpose; overlap tends to push it > 115%)
+    const long long lo = (workAreaArea * 85) / 100;
+    const long long hi = (workAreaArea * 115) / 100;
+
+    if (sumArea < lo || sumArea > hi) {
+      allowCapture = false;
+    }
+  }
+
+  // capture only if allowed
+  if (allowCapture) {
     TilingState capturedState = BuildStateFromWindows(layout, workArea, windows, monitor);
     if (!capturedState.windows.empty()) {
       windows = capturedState.windows;
       masterRatio = ClampDouble(capturedState.masterRatio, 0.1, 0.9);
       stackWeights = capturedState.stackWeights;
-      gridWeights = capturedState.gridWeights;
+      gridWeights  = capturedState.gridWeights;
       usedCaptured = true;
     }
   }
+  // end of buildStateFromWindows section 
+
 
   if (!usedCaptured && hasDesktopId) {
     AcquireSRWLockShared(&g_tilingStateLock);
@@ -1612,7 +1694,7 @@ void RetileFromResize(HWND hwnd) {
       ordered.push_back({w, rect});
     }
 
-    std::sort(ordered.begin(), ordered.end(), [horizontal](const OrderedWindow& a, const OrderedWindow& b) {
+    std::stable_sort(ordered.begin(), ordered.end(), [horizontal](const OrderedWindow& a, const OrderedWindow& b) {
       return horizontal ? (a.rect.top < b.rect.top) : (a.rect.left < b.rect.left);
     });
 
