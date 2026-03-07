@@ -960,6 +960,29 @@ bool IsTileEligible(HWND hwnd, HMONITOR targetMonitor) {
          MonitorFromRect(&frameRect, MONITOR_DEFAULTTONULL) == targetMonitor;
 }
 
+static bool IsWindowTrackedInAnyState(HWND hwnd) {
+  if (!hwnd) return false;
+
+  // normalize to root owner so events from owned windows still match
+  HWND root = GetAncestor(hwnd, GA_ROOTOWNER);
+  if (root) hwnd = root;
+
+  bool tracked = false;
+
+  AcquireSRWLockShared(&g_tilingStateLock);
+  for (const auto& kv : g_tilingStateMap) {
+    const TilingState& st = kv.second;
+    // Fast membership test (linear, but st.windows is small)
+    if (ContainsWindow(st.windows, hwnd)) {
+      tracked = true;
+      break;
+    }
+  }
+  ReleaseSRWLockShared(&g_tilingStateLock);
+
+  return tracked;
+}
+
 void PlaceWindow(HWND hwnd, const RECT& targetRect) {
   if (IsZoomed(hwnd)) ShowWindow(hwnd, SW_RESTORE);
 
@@ -1705,8 +1728,12 @@ void CALLBACK WinEventProc(HWINEVENTHOOK, DWORD event, HWND hwnd, LONG idObject,
     return;
   }
 
+  const bool tracked = IsWindowTrackedInAnyState(hwnd);
+
   // Cache start/end rects for move/size events.
   if (event == EVENT_SYSTEM_MOVESIZESTART || event == EVENT_SYSTEM_MOVESIZEEND) {
+    if (!tracked) return;
+
     AcquireSRWLockExclusive(&g_moveSizeRectsLock);
 
     RECT r{};
@@ -1728,6 +1755,8 @@ void CALLBACK WinEventProc(HWINEVENTHOOK, DWORD event, HWND hwnd, LONG idObject,
 
   // Minimize start: treat like "resize end" for auto-retile behavior.
   if (event == EVENT_SYSTEM_MINIMIZESTART) {
+    if (!tracked) return;
+
     if (IsIconic(hwnd)) {
       OnWindowResizeEnd(hwnd);
     }
@@ -1737,23 +1766,29 @@ void CALLBACK WinEventProc(HWINEVENTHOOK, DWORD event, HWND hwnd, LONG idObject,
   
   // WinDestroy handling is so hard omg
   if (event == EVENT_OBJECT_DESTROY || event == EVENT_OBJECT_HIDE) {
-    RequestPruneDestroyed(hwnd);
+    if (tracked) {    
+      RequestPruneDestroyed(hwnd);
+    }
     return;
   }
   
   if (g_enableTileNewWin && event == EVENT_SYSTEM_MINIMIZEEND) {
-    RequestTileWindows();
+    if (tracked) {
+      RequestTileWindows();
+    }
     return;
   }
 
 
   // Handle window creation / restoration (TileNewWin)
   if (g_enableTileNewWin && (event == EVENT_OBJECT_SHOW || event == EVENT_OBJECT_CREATE)) {
-  HMONITOR mon = MonitorFromWindow(hwnd, MONITOR_DEFAULTTONULL);
-  if (mon && IsTileEligible(hwnd, mon)) {
-      RequestTileWindows();
-  }
-  return;
+    if (!tracked) {
+      HMONITOR mon = MonitorFromWindow(hwnd, MONITOR_DEFAULTTONULL);
+      if (mon && IsTileEligible(hwnd, mon)) {
+          RequestTileWindows();
+      }
+    }
+    return;
   }
 }
 
