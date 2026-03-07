@@ -1693,6 +1693,8 @@ void CALLBACK WinEventProc(HWINEVENTHOOK, DWORD event, HWND hwnd, LONG idObject,
     case EVENT_SYSTEM_MINIMIZEEND:
     case EVENT_OBJECT_CREATE:
     case EVENT_OBJECT_DESTROY:
+    case EVENT_OBJECT_SHOW:
+    case EVENT_OBJECT_HIDE:
       break;
     default:
       return;
@@ -1732,15 +1734,17 @@ void CALLBACK WinEventProc(HWINEVENTHOOK, DWORD event, HWND hwnd, LONG idObject,
 
   
   // WinDestroy handling is so hard omg
-  if (event == EVENT_OBJECT_DESTROY) {
+  if (event == EVENT_OBJECT_DESTROY || event == EVENT_OBJECT_HIDE) {
     RequestPruneDestroyed(hwnd);
     return;
   }
   
 
   // Handle window creation / restoration
-  if ((event == EVENT_OBJECT_CREATE || 
-  event == EVENT_SYSTEM_MINIMIZEEND) 
+  if (
+    (event == EVENT_OBJECT_CREATE || 
+  event == EVENT_SYSTEM_MINIMIZEEND || 
+  EVENT_OBJECT_SHOW ) 
   && g_enableTileNewWin
   ) 
     RequestTileWindows();
@@ -1764,7 +1768,7 @@ void InstallWinEventHooks() {
 
   if (!g_hCreateDestroyHook) {
     g_hCreateDestroyHook = SetWinEventHook(
-      EVENT_OBJECT_CREATE, EVENT_OBJECT_DESTROY,
+      EVENT_OBJECT_CREATE, EVENT_OBJECT_HIDE,
       nullptr, WinEventProc, 0, 0,
       WINEVENT_OUTOFCONTEXT | WINEVENT_SKIPOWNPROCESS
     );
