@@ -1,6 +1,6 @@
 // ==WindhawkMod==
-// @id              tiling-helper
-// @name            Tiling Helper
+// @id              tiling-helper-experimental
+// @name            Tiling Helper Experimental
 // @description     Tile windows on the current monitor with customizable layouts and hotkeys
 // @version         1.0.0
 // @author          u2x1
@@ -1728,7 +1728,9 @@ void CALLBACK WinEventProc(HWINEVENTHOOK, DWORD event, HWND hwnd, LONG idObject,
 
   // Minimize start: treat like "resize end" for auto-retile behavior.
   if (event == EVENT_SYSTEM_MINIMIZESTART) {
-    OnWindowResizeEnd(hwnd);
+    if (IsIconic(hwnd)) {
+      OnWindowResizeEnd(hwnd);
+    }
     return;
   }
 
@@ -1739,16 +1741,20 @@ void CALLBACK WinEventProc(HWINEVENTHOOK, DWORD event, HWND hwnd, LONG idObject,
     return;
   }
   
-
-  // Handle window creation / restoration
-  if (
-    (event == EVENT_OBJECT_CREATE || 
-  event == EVENT_SYSTEM_MINIMIZEEND || 
-  event == EVENT_OBJECT_SHOW ) 
-  && g_enableTileNewWin
-  ) 
+  if (g_enableTileNewWin && event == EVENT_SYSTEM_MINIMIZEEND) {
     RequestTileWindows();
+    return;
+  }
+
+
+  // Handle window creation / restoration (TileNewWin)
+  if (g_enableTileNewWin && (event == EVENT_OBJECT_SHOW || event == EVENT_OBJECT_CREATE)) {
+  HMONITOR mon = MonitorFromWindow(hwnd, MONITOR_DEFAULTTONULL);
+  if (mon && IsTileEligible(hwnd, mon)) {
+      RequestTileWindows();
+  }
   return;
+  }
 }
 
 void InstallWinEventHooks() {
