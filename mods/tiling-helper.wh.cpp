@@ -977,7 +977,7 @@ void PlaceWindow(HWND hwnd, const RECT& targetRect) {
   SetWindowPos(hwnd, nullptr, targetRect.left - offsetLeft, targetRect.top - offsetTop,
                targetRect.right - targetRect.left + offsetLeft + offsetRight,
                targetRect.bottom - targetRect.top + offsetTop + offsetBottom,
-               SWP_NOZORDER | SWP_NOOWNERZORDER | SWP_NOACTIVATE | SWP_NOSENDCHANGING | SWP_ASYNCWINDOWPOS);
+               SWP_NOZORDER | SWP_NOOWNERZORDER | SWP_NOACTIVATE | SWP_NOSENDCHANGING); // | SWP_ASYNCWINDOWPOS);
 }
 
 void SwapMaster() {
@@ -1744,7 +1744,7 @@ void CALLBACK WinEventProc(HWINEVENTHOOK, DWORD event, HWND hwnd, LONG idObject,
   if (
     (event == EVENT_OBJECT_CREATE || 
   event == EVENT_SYSTEM_MINIMIZEEND || 
-  EVENT_OBJECT_SHOW ) 
+  event == EVENT_OBJECT_SHOW ) 
   && g_enableTileNewWin
   ) 
     RequestTileWindows();
