@@ -218,6 +218,10 @@ enum HotkeyIds {
   HK_SWAP_MASTER = 4
 };
 
+// Messages to hotkey thread
+constexpr UINT WM_APP_TILE = WM_APP + 2;
+constexpr UINT WM_APP_PRUNE_DESTROY = WM_APP + 3;
+
 static UINT g_tilingModifiers = MOD_ALT;
 static UINT g_tileKey = 'D';
 static UINT g_layoutKey = 'L';
@@ -1166,6 +1170,78 @@ void TileWindows() {
 }
 
 
+// Used for window destroy hadling
+// Contains inline code from HandleTrivialState() but unavoidable to not cause deadlocks
+static HWND PruneDestroyedAndPickAnchor(HWND deadHwnd) {
+  HWND fg = GetForegroundWindow();
+  HWND anchor = nullptr;
+
+
+  // Obtains current desktopID
+  // "Well ackually since curDesk is a GUID we can't just set it to a null value and check for it later..." 
+  // Okay sure mama
+  GUID curDesk{};
+  bool haveDesk = false;
+  if (fg && IsWindow(fg)) {
+    haveDesk = GetWindowDesktopIdSafe(fg, &curDesk);   // foreground's desktop
+  }
+  if (!haveDesk) {
+    haveDesk = InitializeVirtualDesktopAPI() && GetCurrentDesktopId(&curDesk);  // fallback
+  }
+  if (!haveDesk) return nullptr; // Don't pick a fallback at all if getdesktop fails
+
+
+  HMONITOR curMon = fg ? MonitorFromWindow(fg, MONITOR_DEFAULTTONULL) : nullptr;
+  if (!curMon) {
+    POINT p{}; GetCursorPos(&p);
+    curMon = MonitorFromPoint(p, MONITOR_DEFAULTTONEAREST);
+  }
+
+
+  AcquireSRWLockExclusive(&g_tilingStateLock);
+
+  for (auto it = g_tilingStateMap.begin(); it != g_tilingStateMap.end(); ) {
+    const DesktopMonitorKey key = it->first;
+    TilingState& st = it->second;
+
+    // Erase dead hwnd & empty state
+    // also marks whether current state has been touched or not (affected)
+    size_t before = st.windows.size();
+    st.windows.erase(std::remove(st.windows.begin(), st.windows.end(), deadHwnd), st.windows.end());
+    bool affected = (st.windows.size() != before);
+
+    if (st.windows.empty()) {
+      it = g_tilingStateMap.erase(it);
+      continue;
+    }
+    // ignoring last window (st.windows() = 1) case here
+    // so that RetileOnResize() can pick up the erase + placement job later...
+
+
+    // Pick anchor once: prefer foreground if it maps into this state's windows
+    // otherwise: pick first entry in st.window with the same "monitor % desktopID" pair as fg
+    bool keyMatches = (IsEqualGUID(key.desktopId, curDesk)) &&
+                      (key.monitor == curMon);
+
+    if (!anchor && keyMatches && affected) {
+      if (fg && IsWindow(fg)) {
+        HWND resolved = ResolveToTiledWindow(fg, st.windows);
+        if (resolved && IsWindow(resolved)) anchor = resolved;
+      }
+      if (!anchor) {
+        for (HWND w : st.windows) {
+          if (w && IsWindow(w) && !IsIconic(w)) { anchor = w; break; }
+        }
+      }
+    }
+
+    ++it;
+  }
+
+  ReleaseSRWLockExclusive(&g_tilingStateLock);
+  return anchor;
+}
+
 // used as helper of HandleTrivialState()
 static void EraseState(const DesktopMonitorKey & key){
   AcquireSRWLockExclusive(&g_tilingStateLock);
@@ -1571,6 +1647,28 @@ void OnWindowResizeEnd(HWND hwnd) {
   }
 }
 
+
+static void RequestTileWindows() {
+  if (!g_threadId) return;
+
+  // Reuse existing guards
+  if (InterlockedCompareExchange(&g_retileInProgress, 1, 0) != 0) return;
+
+  if (!PostThreadMessage(g_threadId, WM_APP_TILE, 0, 0)) {
+    InterlockedExchange(&g_retileInProgress, 0);
+  }
+} 
+
+static void RequestPruneDestroyed(HWND dead) {
+  if (!dead) return;
+  if (!g_threadId) return;
+  if (InterlockedCompareExchange(&g_retileInProgress, 1, 0) != 0) return;
+
+  if (!PostThreadMessage(g_threadId, WM_APP_PRUNE_DESTROY, (WPARAM)dead, 0)) {
+    InterlockedExchange(&g_retileInProgress, 0);   
+  }
+}
+
 void CALLBACK WinEventProc(HWINEVENTHOOK, DWORD event, HWND hwnd, LONG idObject, LONG idChild, DWORD, DWORD) {
   
   switch (event) {
@@ -1617,21 +1715,20 @@ void CALLBACK WinEventProc(HWINEVENTHOOK, DWORD event, HWND hwnd, LONG idObject,
     return;
   }
 
-  /*
-  //Add destroy handeling here!!!
-  //Update: doesn't work. HWND goes stale. 
+  
+  // WinDestroy handling is so hard omg
   if (event == EVENT_OBJECT_DESTROY) {
-    OnWindowResizeEnd(hwnd);
+    RequestPruneDestroyed(hwnd);
     return;
   }
-  */
+  
 
   // Handle window creation / restoration
   if ((event == EVENT_OBJECT_CREATE || 
   event == EVENT_SYSTEM_MINIMIZEEND) 
   && g_enableTileNewWin
   ) 
-    TileWindows();
+    RequestTileWindows();
   return;
 }
 
@@ -1799,6 +1896,20 @@ DWORD WINAPI HotkeyThreadProc(LPVOID) {
           HWND resizedHwnd = reinterpret_cast<HWND>(msg.wParam);
           RetileFromResize(resizedHwnd);
           InterlockedExchange(&g_retileInProgress, 0);
+          continue;
+        }
+        if (msg.message == WM_APP_TILE) {
+          TileWindows();
+          InterlockedExchange(&g_retileInProgress, 0);
+          continue;
+        }
+        if (msg.message == WM_APP_PRUNE_DESTROY) {
+          HWND dead = (HWND)msg.wParam;
+          
+          HWND anchor = PruneDestroyedAndPickAnchor(dead);
+          if (anchor) RetileFromResize(anchor);
+
+          InterlockedExchange(&g_retileInProgress, 0); // isn't this redundant
           continue;
         }
         if (msg.message == WM_HOTKEY) {
