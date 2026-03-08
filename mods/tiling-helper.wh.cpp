@@ -1155,8 +1155,6 @@ static inline long long WindowAreaOnWorkArea(HWND hwnd, const RECT& workArea) {
   return RectAreaLL(inter);
 }
 
-static bool HandleTrivialState(const DesktopMonitorKey & key, TilingState & state, const RECT & workArea);
-
 void TileWindows() {
   HWND foregroundWindow = GetForegroundWindow();
   HMONITOR monitor = foregroundWindow ? MonitorFromWindow(foregroundWindow, MONITOR_DEFAULTTONULL) : nullptr;
