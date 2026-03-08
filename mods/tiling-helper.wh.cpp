@@ -554,7 +554,14 @@ TilingState BuildStateFromWindows(TileLayout layout, const RECT& workArea, const
 
 
     // choose master by "closest to 3 workarea edges" score
-    std::vector<std::pair<long long, size_t>> candidates;
+    
+    struct Candidate {
+      long long score;  // Closeness to three edges
+      LONG axisPos;     // Closeness to left & top (tie-break)
+      size_t index;
+    };
+
+    std::vector<Candidate> candidates;
     candidates.reserve(infos.size());
 
     for (size_t i = 0; i < infos.size(); ++i) {
@@ -569,13 +576,31 @@ TilingState BuildStateFromWindows(TileLayout layout, const RECT& workArea, const
 
       std::sort(d, d + 4);
       long long score = d[0] + d[1] + d[2]; // "distance from being master"
-      candidates.emplace_back(score, i);
+      
+      Candidate c;
+      c.score = score;
+      c.axisPos = horizontal 
+        ? (long long)std::llabs((long long)r.left - (long long)workArea.left) 
+        : (long long)std::llabs((long long)r.top  - (long long)workArea.top);
+
+      c.index = i;
+      candidates.push_back(c);
+      //Wh_Log(L"Index %zu rect: L=%ld T=%ld R=%ld B=%ld",
+       i, r.left, r.top, r.right, r.bottom);
+      //Wh_Log(L"Index: %zu, Score: %lld, axisPos: %ld", c.index, c.score, c.axisPos);
+      //candidates.emplace_back(score, i);
     }
 
+    
     std::stable_sort(candidates.begin(), candidates.end(),
-      [](const auto& a, const auto& b) { return a.first < b.first; });
+      [](const auto& a, const auto& b) {
+        if (a.score != b.score)
+          return a.score < b.score;
+        return a.axisPos < b.axisPos;
+//         return a.first < b.first; 
+      });
 
-    size_t masterIndex = candidates.empty() ? 0 : candidates.front().second;
+    size_t masterIndex = candidates.empty() ? 0 : candidates.front().index;
 
     // old logic uses maximum sizes
     /*
@@ -1805,10 +1830,15 @@ void CALLBACK WinEventProc(HWINEVENTHOOK, DWORD event, HWND hwnd, LONG idObject,
       return;
   }
 
+    
+  
+  
   // For window-level events only.
   if (!hwnd || idObject != OBJID_WINDOW || idChild != CHILDID_SELF) {
     return;
   }
+  
+  //Wh_Log(L"Winevent Catched");
 
   const bool tracked = IsWindowTrackedInAnyState(hwnd);
 
@@ -1855,21 +1885,25 @@ void CALLBACK WinEventProc(HWINEVENTHOOK, DWORD event, HWND hwnd, LONG idObject,
   }
   
   if (g_enableTileNewWin && event == EVENT_SYSTEM_MINIMIZEEND) {
-    if (tracked) {
+    RequestTileWindows();
+    //Why did I add this filter
+    
+    if (!tracked) {
       RequestTileWindows();
     }
+    
     return;
   }
 
 
   // Handle window creation / restoration (TileNewWin)
   if (g_enableTileNewWin && (event == EVENT_OBJECT_SHOW || event == EVENT_OBJECT_CREATE)) {
+    //RequestTileWindows();
+    
     if (!tracked) {
-      HMONITOR mon = MonitorFromWindow(hwnd, MONITOR_DEFAULTTONULL);
-      if (mon && IsTileEligible(hwnd, mon)) {
-          RequestTileWindows();
-      }
+      RequestTileWindows();
     }
+    
     return;
   }
 }
