@@ -602,6 +602,9 @@ TilingState BuildStateFromWindows(TileLayout layout, const RECT& workArea, const
 
     size_t masterIndex = candidates.empty() ? 0 : candidates.front().index;
 
+    Wh_Log(L"Master identified: Score: %lld, axisPos: %lld", candidates.front().score, candidates.front().axisPos);
+
+
     // old logic uses maximum sizes
     /*
     size_t masterIndex = 0;
@@ -1190,17 +1193,21 @@ void TileWindows() {
   bool usedCaptured = false;
 
   // determine whether a saved state already exists for this desktop+monitor
-  bool hasSavedStateForKey = false;
+  bool hasSavedStateForKeyLayoutPair = false;
   if (hasDesktopId) {
     AcquireSRWLockShared(&g_tilingStateLock);
-    hasSavedStateForKey = (g_tilingStateMap.find(key) != g_tilingStateMap.end());
+    auto it = g_tilingStateMap.find(key);
+    hasSavedStateForKeyLayoutPair = (it != g_tilingStateMap.end())
+    ? it->second.layout == layout
+    : false;
     ReleaseSRWLockShared(&g_tilingStateLock);
   }
 
   // decide if capture is allowed on first-time state creation
   // simply put: (do windows look tiled enough) ? capture layout : use defaults
   bool allowCapture = g_captureLayoutOnTile;
-  if (allowCapture && hasDesktopId && !hasSavedStateForKey) {
+  
+  if (allowCapture && hasDesktopId && !hasSavedStateForKeyLayoutPair) {
     const long long workAreaArea = RectAreaLL(workArea);
 
     long long sumArea = 0;
