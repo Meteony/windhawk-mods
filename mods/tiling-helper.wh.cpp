@@ -1845,6 +1845,7 @@ void CALLBACK WinEventProc(HWINEVENTHOOK, DWORD event, HWND hwnd, LONG idObject,
   if (!hwnd || idObject != OBJID_WINDOW || idChild != CHILDID_SELF) {
     return;
   }
+
   
   Wh_Log(L"Winevent Catched");
 
@@ -1867,7 +1868,7 @@ void CALLBACK WinEventProc(HWINEVENTHOOK, DWORD event, HWND hwnd, LONG idObject,
 
         ReleaseSRWLockExclusive(&g_moveSizeRectsLock);
     };
-    
+
     if (event == EVENT_SYSTEM_MOVESIZEEND) {
       OnWindowResizeEnd(hwnd);
     }
@@ -1894,7 +1895,7 @@ void CALLBACK WinEventProc(HWINEVENTHOOK, DWORD event, HWND hwnd, LONG idObject,
   }
   
   if (g_enableTileNewWin && event == EVENT_SYSTEM_MINIMIZEEND) {
-    RequestTileWindows();
+    //RequestTileWindows();
     //Why did I add this filter
     
     if (!tracked) {
