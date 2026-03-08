@@ -557,7 +557,7 @@ TilingState BuildStateFromWindows(TileLayout layout, const RECT& workArea, const
     
     struct Candidate {
       long long score;  // Closeness to three edges
-      LONG axisPos;     // Closeness to left & top (tie-break)
+      long long axisPos;     // Closeness to left & top (tie-break)
       size_t index;
     };
 
@@ -580,14 +580,14 @@ TilingState BuildStateFromWindows(TileLayout layout, const RECT& workArea, const
       Candidate c;
       c.score = score;
       c.axisPos = horizontal 
-        ? (long long)std::llabs((long long)r.left - (long long)workArea.left) 
-        : (long long)std::llabs((long long)r.top  - (long long)workArea.top);
+        ? (long long)std::llabs((long long)r.top  - (long long)workArea.top)
+        : (long long)std::llabs((long long)r.left - (long long)workArea.left);
 
       c.index = i;
       candidates.push_back(c);
-      //Wh_Log(L"Index %zu rect: L=%ld T=%ld R=%ld B=%ld",
+      Wh_Log(L"Index %zu rect: L=%ld T=%ld R=%ld B=%ld",
        i, r.left, r.top, r.right, r.bottom);
-      //Wh_Log(L"Index: %zu, Score: %lld, axisPos: %ld", c.index, c.score, c.axisPos);
+      Wh_Log(L"Index: %zu, Score: %lld, axisPos: %lld", c.index, c.score, c.axisPos);
       //candidates.emplace_back(score, i);
     }
 
@@ -1838,7 +1838,7 @@ void CALLBACK WinEventProc(HWINEVENTHOOK, DWORD event, HWND hwnd, LONG idObject,
     return;
   }
   
-  //Wh_Log(L"Winevent Catched");
+  Wh_Log(L"Winevent Catched");
 
   const bool tracked = IsWindowTrackedInAnyState(hwnd);
 
