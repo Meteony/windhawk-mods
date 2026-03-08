@@ -1155,6 +1155,8 @@ static inline long long WindowAreaOnWorkArea(HWND hwnd, const RECT& workArea) {
   return RectAreaLL(inter);
 }
 
+static bool HandleTrivialState(const DesktopMonitorKey & key, TilingState & state, const RECT & workArea);
+
 void TileWindows() {
   HWND foregroundWindow = GetForegroundWindow();
   HMONITOR monitor = foregroundWindow ? MonitorFromWindow(foregroundWindow, MONITOR_DEFAULTTONULL) : nullptr;
@@ -1280,7 +1282,7 @@ void TileWindows() {
     PlaceWindow(windows[i], windowRects[i]);
   }
 
-  if (hasDesktopId) {
+  if (hasDesktopId && windows.size() > 1) {
     TilingState state;
     state.layout = layout;
     state.windows = windows;
@@ -1304,6 +1306,7 @@ void TileWindows() {
   }
 
   Wh_Log(L"Tiled %zu windows with layout %d", windows.size(), static_cast<int>(layout));
+  
 }
 
 
