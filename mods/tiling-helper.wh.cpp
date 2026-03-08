@@ -1853,20 +1853,21 @@ void CALLBACK WinEventProc(HWINEVENTHOOK, DWORD event, HWND hwnd, LONG idObject,
   // Cache start/end rects for move/size events.
   if (event == EVENT_SYSTEM_MOVESIZESTART || event == EVENT_SYSTEM_MOVESIZEEND) {
     if (!tracked) return;
+    if (!g_enableTileNewWin) {
+        AcquireSRWLockExclusive(&g_moveSizeRectsLock);
 
-    AcquireSRWLockExclusive(&g_moveSizeRectsLock);
+        RECT r{};
+        if (GetWindowFrameRect(hwnd, &r)) {
+        if (event == EVENT_SYSTEM_MOVESIZESTART) {
+            g_moveSizeStartRects[hwnd] = r;
+        } else { // MOVESIZEEND
+            g_moveSizeEndRects[hwnd] = r;
+        }
+        }
 
-    RECT r{};
-    if (GetWindowFrameRect(hwnd, &r)) {
-      if (event == EVENT_SYSTEM_MOVESIZESTART) {
-        g_moveSizeStartRects[hwnd] = r;
-      } else { // MOVESIZEEND
-        g_moveSizeEndRects[hwnd] = r;
-      }
-    }
-
-    ReleaseSRWLockExclusive(&g_moveSizeRectsLock);
-
+        ReleaseSRWLockExclusive(&g_moveSizeRectsLock);
+    };
+    
     if (event == EVENT_SYSTEM_MOVESIZEEND) {
       OnWindowResizeEnd(hwnd);
     }
