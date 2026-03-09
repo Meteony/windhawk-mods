@@ -1238,7 +1238,10 @@ void TileWindows() {
     // if NOT within ±15% of workArea coverage, skip capture
     // (sumArea is overlap-sensitive on purpose; overlap tends to push it > 115%)
     const long long lo = (workAreaArea * 85) / 100;
-    const long long hi = (workAreaArea * 115) / 100;
+    const long long hi = 
+      (windows.size() <= 2)
+      ? (workAreaArea * 115) / 100
+      : (workAreaArea * 105) / 100;
 
     if (sumArea < lo || sumArea > hi) {
       allowCapture = false;
