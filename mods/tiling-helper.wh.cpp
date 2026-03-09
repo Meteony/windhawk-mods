@@ -527,11 +527,20 @@ std::vector<HWND> CollectTileWindows(HMONITOR monitor) {
 }
 
 TilingState BuildStateFromWindows(TileLayout layout, const RECT& workArea, const std::vector<HWND>& windows,
-                                  HMONITOR monitor) {
+                                  HMONITOR monitor, HWND preferredFirstWin = nullptr) {
   TilingState state;
   state.layout = layout;
   state.windows = windows;
   if (windows.empty()) return state;
+  /*
+  // prefer current master window
+  if (preferredFirstWin){
+    auto itWin = std::find(state.windows.begin(), state.windows.end(), preferredFirstWin);
+    if (itWin != state.windows.end()) {
+      std::iter_swap(itWin, state.windows.begin());
+    }
+  }
+  */
 
   if (layout == TileLayout::MasterStack || layout == TileLayout::MasterStackH) {
     bool horizontal = (layout == TileLayout::MasterStackH);
@@ -540,8 +549,8 @@ TilingState BuildStateFromWindows(TileLayout layout, const RECT& workArea, const
       RECT rect;
     };
     std::vector<WindowInfo> infos;
-    infos.reserve(windows.size());
-    for (HWND w : windows) {
+    infos.reserve(state.windows.size());
+    for (HWND w : state.windows) {
       RECT rect = {};
       if (!GetWindowFrameRect(w, &rect)) {
         rect = workArea;
@@ -593,11 +602,18 @@ TilingState BuildStateFromWindows(TileLayout layout, const RECT& workArea, const
 
     
     std::stable_sort(candidates.begin(), candidates.end(),
-      [](const auto& a, const auto& b) {
+      [preferredFirstWin, &infos](const auto& a, const auto& b) {
+        // first comparison key: existing master always goes first
+        bool aPreferred = preferredFirstWin && infos[a.index].hwnd == preferredFirstWin;
+        bool bPreferred = preferredFirstWin && infos[b.index].hwnd == preferredFirstWin;
+
+        if (aPreferred != bPreferred)
+          return aPreferred;
+
+        // later comparisons use closeness score
         if (a.score != b.score)
           return a.score < b.score;
         return a.axisPos < b.axisPos;
-//         return a.first < b.first; 
       });
 
     size_t masterIndex = candidates.empty() ? 0 : candidates.front().index;
@@ -656,8 +672,8 @@ TilingState BuildStateFromWindows(TileLayout layout, const RECT& workArea, const
       RECT rect;
     };
     std::vector<WindowInfo> infos;
-    infos.reserve(windows.size());
-    for (HWND w : windows) {
+    infos.reserve(state.windows.size());
+    for (HWND w : state.windows) {
       RECT rect = {};
       if (!GetWindowFrameRect(w, &rect)) {
         rect = workArea;
@@ -1194,12 +1210,16 @@ void TileWindows() {
 
   // determine whether a saved state already exists for this desktop+monitor
   bool hasSavedStateForKeyLayoutPair = false;
+  HWND curWinZero {nullptr};
   if (hasDesktopId) {
     AcquireSRWLockShared(&g_tilingStateLock);
     auto it = g_tilingStateMap.find(key);
     hasSavedStateForKeyLayoutPair = (it != g_tilingStateMap.end())
     ? it->second.layout == layout
     : false;
+    // save first window in pre-tiling state
+    if (hasSavedStateForKeyLayoutPair && it->second.windows.size() > 0) 
+      curWinZero = {it->second.windows.front()};
     ReleaseSRWLockShared(&g_tilingStateLock);
   }
 
@@ -1227,7 +1247,7 @@ void TileWindows() {
 
   // capture only if allowed
   if (allowCapture) {
-    TilingState capturedState = BuildStateFromWindows(layout, workArea, windows, monitor);
+    TilingState capturedState = BuildStateFromWindows(layout, workArea, windows, monitor, curWinZero);
     if (!capturedState.windows.empty()) {
       windows = capturedState.windows;
       masterRatio = ClampDouble(capturedState.masterRatio, 0.1, 0.9);
@@ -1847,7 +1867,7 @@ void CALLBACK WinEventProc(HWINEVENTHOOK, DWORD event, HWND hwnd, LONG idObject,
   }
 
   
-  Wh_Log(L"Winevent Catched");
+  //Wh_Log(L"Winevent Catched");
 
   const bool tracked = IsWindowTrackedInAnyState(hwnd);
 
