@@ -1303,7 +1303,7 @@ void TileWindows() {
     PlaceWindow(windows[i], windowRects[i]);
   }
 
-  if (hasDesktopId && windows.size() > 1) {
+  if (hasDesktopId) {
     TilingState state;
     state.layout = layout;
     state.windows = windows;
@@ -1322,9 +1322,16 @@ void TileWindows() {
     }
 
     AcquireSRWLockExclusive(&g_tilingStateLock);
-    g_tilingStateMap[key] = std::move(state);
+    if (windows.size() > 1) {
+      g_tilingStateMap[key] = std::move(state);
+    }
+    else {
+      g_tilingStateMap.erase(key);
+    }
     ReleaseSRWLockExclusive(&g_tilingStateLock);
+
   }
+
 
   Wh_Log(L"Tiled %zu windows with layout %d", windows.size(), static_cast<int>(layout));
   
@@ -1332,12 +1339,11 @@ void TileWindows() {
 
 
 // Used for window destroy hadling
-// Contains inline code from HandleTrivialState() but unavoidable to not cause deadlocks
 static HWND PruneDestroyedAndPickAnchor(HWND deadHwnd) {
   HWND fg = GetForegroundWindow();
   HWND anchor = nullptr;
 
-  // Really don't want dead HWNDs to be there
+  // Really don't want dead HWNDs to be in there
   AcquireSRWLockExclusive(&g_moveSizeRectsLock);
   g_moveSizeStartRects.erase(deadHwnd);
   g_moveSizeEndRects.erase(deadHwnd);
