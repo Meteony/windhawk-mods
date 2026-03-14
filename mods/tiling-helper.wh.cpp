@@ -293,7 +293,7 @@ static SRWLOCK g_moveSizeRectsLock = SRWLOCK_INIT;
 static volatile LONG g_retileInProgress = 0;
 static HWINEVENTHOOK g_hMoveSizeHook = nullptr;
 static HWINEVENTHOOK g_hMinimizeHook = nullptr;
-static HWINEVENTHOOK g_hCreateDestroyHook = nullptr;
+static HWINEVENTHOOK g_hHideDestroyHook = nullptr;
 static HWINEVENTHOOK g_hCloakHook = nullptr;
 
 //=============================================================================
@@ -1005,49 +1005,6 @@ bool IsWindowCloaked(HWND hwnd) {
   return cloaked;
 }
 
-static bool CouldBeTileEligible(HWND hwnd) {
-  if (!hwnd) return false;
-
-  if (GetAncestor(hwnd, GA_ROOT) != hwnd || GetWindow(hwnd, GW_OWNER)) return false;
-
-  LONG_PTR style = GetWindowLongPtr(hwnd, GWL_STYLE);
-  if ((style & WS_CHILD) || !(style & WS_SIZEBOX)) return false;
-
-  LONG_PTR exStyle = GetWindowLongPtr(hwnd, GWL_EXSTYLE);
-  if (exStyle & (WS_EX_TOOLWINDOW | WS_EX_NOACTIVATE)) return false;
-
-  wchar_t className[64];
-  if (GetClassNameW(hwnd, className, 64)) {
-    for (const auto* ignoredClass : kIgnoredWindowClasses) {
-      if (_wcsicmp(className, ignoredClass) == 0) return false;
-    }
-  }
-
-  return true;
-}
-
-bool IsTileEligible(HWND hwnd, HMONITOR targetMonitor) {
-  if (!IsWindowVisible(hwnd) || IsIconic(hwnd) || !IsWindowEnabled(hwnd)) return false;
-  if (!CouldBeTileEligible(hwnd)) return false;
-  if (IsWindowCloaked(hwnd)) return false;
-
-  // Virtual desktop filter: other desktops' windows may not yet be cloaked
-  // at the moment we enumerate (race between uncloak/cloak during switch).
-  if (g_pDesktopManager) {
-    BOOL onCurrent = FALSE;
-    if (SUCCEEDED(g_pDesktopManager->IsWindowOnCurrentVirtualDesktop(hwnd, &onCurrent)) && !onCurrent)
-      return false;
-  }
-
-  RECT frameRect;
-  if (!SUCCEEDED(DwmGetWindowAttribute(hwnd, DWMWA_EXTENDED_FRAME_BOUNDS, &frameRect, sizeof(frameRect)))) {
-    if (!GetWindowRect(hwnd, &frameRect)) return false;
-  }
-
-  return frameRect.right > frameRect.left && frameRect.bottom > frameRect.top &&
-         MonitorFromRect(&frameRect, MONITOR_DEFAULTTONULL) == targetMonitor;
-}
-
 static bool IsWindowTrackedInAnyState(HWND hwnd) {
   if (!hwnd) return false;
 
@@ -1070,6 +1027,52 @@ static bool IsWindowTrackedInAnyState(HWND hwnd) {
   ReleaseSRWLockShared(&g_tilingStateLock);
 
   return tracked;
+}
+
+static bool CouldBeTileEligible(HWND hwnd) {
+  if (!hwnd) return false;
+
+  if (GetAncestor(hwnd, GA_ROOT) != hwnd || GetWindow(hwnd, GW_OWNER)) return false;
+
+  LONG_PTR style = GetWindowLongPtr(hwnd, GWL_STYLE);
+  if (style & WS_CHILD) return false;
+  
+  if (!(style & WS_SIZEBOX) && !IsWindowTrackedInAnyState(hwnd)) return false;
+
+  LONG_PTR exStyle = GetWindowLongPtr(hwnd, GWL_EXSTYLE);
+  if (exStyle & (WS_EX_TOOLWINDOW | WS_EX_NOACTIVATE)) return false;
+
+  wchar_t className[64];
+  if (GetClassNameW(hwnd, className, 64)) {
+    for (const auto* ignoredClass : kIgnoredWindowClasses) {
+      if (_wcsicmp(className, ignoredClass) == 0) return false;
+    }
+  }
+
+  return true;
+}
+
+bool IsTileEligible(HWND hwnd, HMONITOR targetMonitor) {
+  if (!IsWindowTrackedInAnyState(hwnd) && !IsWindowEnabled(hwnd)) return false;
+  if (!IsWindowVisible(hwnd) || IsIconic(hwnd)) return false;
+  if (!CouldBeTileEligible(hwnd)) return false;
+  if (IsWindowCloaked(hwnd)) return false;
+
+  // Virtual desktop filter: other desktops' windows may not yet be cloaked
+  // at the moment we enumerate (race between uncloak/cloak during switch).
+  if (g_pDesktopManager) {
+    BOOL onCurrent = FALSE;
+    if (SUCCEEDED(g_pDesktopManager->IsWindowOnCurrentVirtualDesktop(hwnd, &onCurrent)) && !onCurrent)
+      return false;
+  }
+
+  RECT frameRect;
+  if (!SUCCEEDED(DwmGetWindowAttribute(hwnd, DWMWA_EXTENDED_FRAME_BOUNDS, &frameRect, sizeof(frameRect)))) {
+    if (!GetWindowRect(hwnd, &frameRect)) return false;
+  }
+
+  return frameRect.right > frameRect.left && frameRect.bottom > frameRect.top &&
+         MonitorFromRect(&frameRect, MONITOR_DEFAULTTONULL) == targetMonitor;
 }
 
 void PlaceWindow(HWND hwnd, const RECT& targetRect) {
@@ -1208,14 +1211,15 @@ void TileWindows() {
 
   if (workArea.right <= workArea.left || workArea.bottom <= workArea.top) return;
 
+  GUID desktopId = {};
+  bool hasDesktopId = InitializeVirtualDesktopAPI() && GetCurrentDesktopId(&desktopId);
+  DesktopMonitorKey key{desktopId, monitor};
+
   std::vector<HWND> windows = CollectTileWindows(monitor);
   if (windows.empty()) return;
 
   TileLayout layout = g_currentLayout;
 
-  GUID desktopId = {};
-  bool hasDesktopId = InitializeVirtualDesktopAPI() && GetCurrentDesktopId(&desktopId);
-  DesktopMonitorKey key{desktopId, monitor};
 
   double masterRatio = ClampDouble(g_masterPercent / 100.0, 0.1, 0.9);
   std::vector<double> stackWeights;
@@ -1875,7 +1879,6 @@ void CALLBACK WinEventProc(HWINEVENTHOOK, DWORD event, HWND hwnd, LONG idObject,
     case EVENT_SYSTEM_MOVESIZEEND:
     case EVENT_SYSTEM_MINIMIZESTART:
     case EVENT_SYSTEM_MINIMIZEEND:
-    case EVENT_OBJECT_CREATE:
     case EVENT_OBJECT_DESTROY:
     case EVENT_OBJECT_SHOW:
     case EVENT_OBJECT_HIDE:
@@ -1930,7 +1933,7 @@ void CALLBACK WinEventProc(HWINEVENTHOOK, DWORD event, HWND hwnd, LONG idObject,
   }
 
   
-  // WinDestroy handling is so hard omg
+  // Destroyed Window handling
   if (event == EVENT_OBJECT_DESTROY || event == EVENT_OBJECT_HIDE) {
     if (tracked) {
       RequestPruneDestroyed(hwnd);
@@ -1940,7 +1943,6 @@ void CALLBACK WinEventProc(HWINEVENTHOOK, DWORD event, HWND hwnd, LONG idObject,
 
   if (g_enableTileNewWin && event == EVENT_SYSTEM_MINIMIZEEND) {
     //RequestTileWindows();
-    //Why did I add this filter
     
     if (!tracked && CouldBeTileEligible(hwnd)) {
       RequestTileWindows();
@@ -1976,13 +1978,13 @@ void InstallWinEventHooks() {
     if (!g_hMinimizeHook) Wh_Log(L"Failed to install minimization hook");
   }
 
-  if (!g_hCreateDestroyHook) {
-    g_hCreateDestroyHook = SetWinEventHook(
-      EVENT_OBJECT_CREATE, EVENT_OBJECT_HIDE,
+  if (!g_hHideDestroyHook) {
+    g_hHideDestroyHook = SetWinEventHook(
+      EVENT_OBJECT_DESTROY, EVENT_OBJECT_HIDE,
       nullptr, WinEventProc, 0, 0,
       WINEVENT_OUTOFCONTEXT | WINEVENT_SKIPOWNPROCESS
     );
-    if (!g_hCreateDestroyHook) Wh_Log(L"Failed to install create/destroy hook");
+    if (!g_hHideDestroyHook) Wh_Log(L"Failed to install hide/destroy hook");
   }
 
   if (!g_hCloakHook) {
@@ -2004,9 +2006,9 @@ void RemoveWinEventHooks() {
         UnhookWinEvent(g_hMinimizeHook);
         g_hMinimizeHook = nullptr;
     }
-    if (g_hCreateDestroyHook) {
-        UnhookWinEvent(g_hCreateDestroyHook);
-        g_hCreateDestroyHook = nullptr;
+    if (g_hHideDestroyHook) {
+        UnhookWinEvent(g_hHideDestroyHook);
+        g_hHideDestroyHook = nullptr;
     }
     if (g_hCloakHook) {
         UnhookWinEvent(g_hCloakHook);
