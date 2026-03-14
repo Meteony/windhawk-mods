@@ -1007,7 +1007,6 @@ static bool IsWindowTrackedInAnyState(HWND hwnd) {
   if (!hwnd) return false;
 
   // normalize to root owner so events from owned windows still match
-  HWND original = hwnd;
   HWND root = GetAncestor(hwnd, GA_ROOTOWNER);
   if (root) hwnd = root;
 
