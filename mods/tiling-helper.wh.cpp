@@ -294,6 +294,7 @@ static volatile LONG g_retileInProgress = 0;
 static HWINEVENTHOOK g_hMoveSizeHook = nullptr;
 static HWINEVENTHOOK g_hMinimizeHook = nullptr;
 static HWINEVENTHOOK g_hCreateDestroyHook = nullptr;
+static HWINEVENTHOOK g_hCloakHook = nullptr;
 
 //=============================================================================
 //Cache Rects
@@ -1004,8 +1005,9 @@ bool IsWindowCloaked(HWND hwnd) {
   return cloaked;
 }
 
-bool IsTileEligible(HWND hwnd, HMONITOR targetMonitor) {
-  if (!IsWindowVisible(hwnd) || IsIconic(hwnd) || !IsWindowEnabled(hwnd)) return false;
+static bool CouldBeTileEligible(HWND hwnd) {
+  if (!hwnd) return false;
+
   if (GetAncestor(hwnd, GA_ROOT) != hwnd || GetWindow(hwnd, GW_OWNER)) return false;
 
   LONG_PTR style = GetWindowLongPtr(hwnd, GWL_STYLE);
@@ -1014,13 +1016,27 @@ bool IsTileEligible(HWND hwnd, HMONITOR targetMonitor) {
   LONG_PTR exStyle = GetWindowLongPtr(hwnd, GWL_EXSTYLE);
   if (exStyle & (WS_EX_TOOLWINDOW | WS_EX_NOACTIVATE)) return false;
 
-  if (IsWindowCloaked(hwnd)) return false;
-
   wchar_t className[64];
   if (GetClassNameW(hwnd, className, 64)) {
     for (const auto* ignoredClass : kIgnoredWindowClasses) {
       if (_wcsicmp(className, ignoredClass) == 0) return false;
     }
+  }
+
+  return true;
+}
+
+bool IsTileEligible(HWND hwnd, HMONITOR targetMonitor) {
+  if (!IsWindowVisible(hwnd) || IsIconic(hwnd) || !IsWindowEnabled(hwnd)) return false;
+  if (!CouldBeTileEligible(hwnd)) return false;
+  if (IsWindowCloaked(hwnd)) return false;
+
+  // Virtual desktop filter: other desktops' windows may not yet be cloaked
+  // at the moment we enumerate (race between uncloak/cloak during switch).
+  if (g_pDesktopManager) {
+    BOOL onCurrent = FALSE;
+    if (SUCCEEDED(g_pDesktopManager->IsWindowOnCurrentVirtualDesktop(hwnd, &onCurrent)) && !onCurrent)
+      return false;
   }
 
   RECT frameRect;
@@ -1036,6 +1052,7 @@ static bool IsWindowTrackedInAnyState(HWND hwnd) {
   if (!hwnd) return false;
 
   // normalize to root owner so events from owned windows still match
+  HWND original = hwnd;
   HWND root = GetAncestor(hwnd, GA_ROOTOWNER);
   if (root) hwnd = root;
 
@@ -1862,14 +1879,12 @@ void CALLBACK WinEventProc(HWINEVENTHOOK, DWORD event, HWND hwnd, LONG idObject,
     case EVENT_OBJECT_DESTROY:
     case EVENT_OBJECT_SHOW:
     case EVENT_OBJECT_HIDE:
+    case EVENT_OBJECT_UNCLOAKED:
       break;
     default:
       return;
   }
 
-    
-  
-  
   // For window-level events only.
   if (!hwnd || idObject != OBJID_WINDOW || idChild != CHILDID_SELF) {
     return;
@@ -1917,29 +1932,28 @@ void CALLBACK WinEventProc(HWINEVENTHOOK, DWORD event, HWND hwnd, LONG idObject,
   
   // WinDestroy handling is so hard omg
   if (event == EVENT_OBJECT_DESTROY || event == EVENT_OBJECT_HIDE) {
-    if (tracked) {    
+    if (tracked) {
       RequestPruneDestroyed(hwnd);
     }
     return;
   }
-  
+
   if (g_enableTileNewWin && event == EVENT_SYSTEM_MINIMIZEEND) {
     //RequestTileWindows();
     //Why did I add this filter
     
-    if (!tracked) {
+    if (!tracked && CouldBeTileEligible(hwnd)) {
       RequestTileWindows();
     }
-    
     return;
   }
 
-
   // Handle window creation / restoration (TileNewWin)
-  if (g_enableTileNewWin && (event == EVENT_OBJECT_SHOW || event == EVENT_OBJECT_CREATE)) {
-    //RequestTileWindows();
-    
-    if (!tracked) {
+  // SHOW: Win32
+  // UNCLOAKED: UWP ApplicationFrameWindow
+  if (g_enableTileNewWin
+      && (event == EVENT_OBJECT_SHOW || event == EVENT_OBJECT_UNCLOAKED)) {
+    if (!tracked && CouldBeTileEligible(hwnd)) {
       RequestTileWindows();
     }
     
@@ -1970,6 +1984,15 @@ void InstallWinEventHooks() {
     );
     if (!g_hCreateDestroyHook) Wh_Log(L"Failed to install create/destroy hook");
   }
+
+  if (!g_hCloakHook) {
+    g_hCloakHook = SetWinEventHook(
+      EVENT_OBJECT_UNCLOAKED, EVENT_OBJECT_UNCLOAKED,
+      nullptr, WinEventProc, 0, 0,
+      WINEVENT_OUTOFCONTEXT | WINEVENT_SKIPOWNPROCESS
+    );
+    if (!g_hCloakHook) Wh_Log(L"Failed to install uncloak hook");
+  }
 }
 
 void RemoveWinEventHooks() {
@@ -1984,6 +2007,10 @@ void RemoveWinEventHooks() {
     if (g_hCreateDestroyHook) {
         UnhookWinEvent(g_hCreateDestroyHook);
         g_hCreateDestroyHook = nullptr;
+    }
+    if (g_hCloakHook) {
+        UnhookWinEvent(g_hCloakHook);
+        g_hCloakHook = nullptr;
     }
 }
 
