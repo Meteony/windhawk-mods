@@ -288,7 +288,7 @@ struct TilingState {
 static std::unordered_map<DesktopMonitorKey, TilingState, DesktopMonitorKeyHash, DesktopMonitorKeyEqual>
     g_tilingStateMap;
 static SRWLOCK g_tilingStateLock = SRWLOCK_INIT;
-//Rect cache thread safety lock
+// Rect cache thread safety lock
 static SRWLOCK g_moveSizeRectsLock = SRWLOCK_INIT;
 static volatile LONG g_retileInProgress = 0;
 static HWINEVENTHOOK g_hMoveSizeHook = nullptr;
@@ -598,7 +598,6 @@ TilingState BuildStateFromWindows(TileLayout layout, const RECT& workArea, const
       Wh_Log(L"Index %zu rect: L=%ld T=%ld R=%ld B=%ld",
        i, r.left, r.top, r.right, r.bottom);
       Wh_Log(L"Index: %zu, Score: %lld, axisPos: %lld", c.index, c.score, c.axisPos);
-      //candidates.emplace_back(score, i);
     }
 
     
@@ -725,7 +724,6 @@ std::vector<LONG> ComputeWeightedSizes(LONG totalSize, LONG gap, const std::vect
 
     } else {
       double ratio = w / remainingSum;
-      //Fix loop logic
       size = static_cast<LONG>(std::llround(static_cast<double>(available - used) * ratio));
       if (size < 1) size = 1;
       LONG maxSize = available - used - remainingSlots;
@@ -1036,7 +1034,9 @@ static bool CouldBeTileEligible(HWND hwnd) {
 
   LONG_PTR style = GetWindowLongPtr(hwnd, GWL_STYLE);
   if (style & WS_CHILD) return false;
-  
+
+  // window could temporarily lose its WS_SizeBox. 
+  // (example: Office save/discard dialog)
   if (!(style & WS_SIZEBOX) && !IsWindowTrackedInAnyState(hwnd)) return false;
 
   LONG_PTR exStyle = GetWindowLongPtr(hwnd, GWL_EXSTYLE);
@@ -1053,7 +1053,10 @@ static bool CouldBeTileEligible(HWND hwnd) {
 }
 
 bool IsTileEligible(HWND hwnd, HMONITOR targetMonitor) {
+  // window might become temporarily disabled
+  // (example: VSCode unstaged commit dialog)
   if (!IsWindowTrackedInAnyState(hwnd) && !IsWindowEnabled(hwnd)) return false;
+
   if (!IsWindowVisible(hwnd) || IsIconic(hwnd)) return false;
   if (!CouldBeTileEligible(hwnd)) return false;
   if (IsWindowCloaked(hwnd)) return false;
@@ -1092,7 +1095,7 @@ void PlaceWindow(HWND hwnd, const RECT& targetRect) {
   SetWindowPos(hwnd, nullptr, targetRect.left - offsetLeft, targetRect.top - offsetTop,
                targetRect.right - targetRect.left + offsetLeft + offsetRight,
                targetRect.bottom - targetRect.top + offsetTop + offsetBottom,
-               SWP_NOZORDER | SWP_NOOWNERZORDER | SWP_NOACTIVATE | SWP_NOSENDCHANGING); // | SWP_ASYNCWINDOWPOS);
+               SWP_NOZORDER | SWP_NOOWNERZORDER | SWP_NOACTIVATE | SWP_NOSENDCHANGING); 
 }
 
 void SwapMaster() {
@@ -1157,8 +1160,7 @@ swap_cleanup:
     PlaceWindow(oldMaster, rResolved);
     PlaceWindow(resolved,  rMaster);
 
-    // cleaning up rect caches just in case. 
-    // don't think it's necessary tho
+    // purge potential stale window rects after swapping  
     AcquireSRWLockExclusive(&g_moveSizeRectsLock);
     g_moveSizeStartRects.erase(oldMaster);
     g_moveSizeEndRects.erase(oldMaster);
@@ -1226,7 +1228,7 @@ void TileWindows() {
   std::vector<double> gridWeights;
 
 
-  // below section builds state from windows
+  // start of: buildStateFromWindows section 
   bool usedCaptured = false;
 
   // determine whether a saved state already exists for this desktop+monitor
@@ -1245,7 +1247,7 @@ void TileWindows() {
   }
 
   // decide if capture is allowed on first-time state creation
-  // simply put: (do windows look tiled enough) ? capture layout : use defaults
+  // core: (do windows look tiled) ? capture layout : use defaults
   bool allowCapture = g_captureLayoutOnTile;
   
   if (allowCapture && hasDesktopId && !hasSavedStateForKeyLayoutPair) {
@@ -1280,7 +1282,7 @@ void TileWindows() {
       usedCaptured = true;
     }
   }
-  // end of buildStateFromWindows section 
+  // end of: buildStateFromWindows section 
 
 
   if (!usedCaptured && hasDesktopId) {
@@ -1359,20 +1361,18 @@ void TileWindows() {
 }
 
 
-// Used for window destroy hadling
+// Helper for window destroy handling
 static HWND PruneDestroyedAndPickAnchor(HWND deadHwnd) {
   HWND fg = GetForegroundWindow();
   HWND anchor = nullptr;
 
-  // Really don't want dead HWNDs to be in there
+  // Purge now-stale moveSizeRects
   AcquireSRWLockExclusive(&g_moveSizeRectsLock);
   g_moveSizeStartRects.erase(deadHwnd);
   g_moveSizeEndRects.erase(deadHwnd);
   ReleaseSRWLockExclusive(&g_moveSizeRectsLock);
 
-  // Obtains current desktopID
-  // "Well ackually since curDesk is a GUID we can't just set it to a null value and check for it later..." 
-  // Okay sure mama
+  // Get current desktopID
   GUID curDesk{};
   bool haveDesk = false;
   if (fg && IsWindow(fg)) {
@@ -1427,7 +1427,7 @@ static HWND PruneDestroyedAndPickAnchor(HWND deadHwnd) {
           if (w && IsWindow(w) && !IsIconic(w)) { anchor = w; break; }
         }
       }
-      // If all windows are minimized somehow: 
+      // If all windows are minimized (rare-case): 
       // skip minimiization check to at least return an anchor
       if (!anchor) {
         for (HWND w : st.windows) {
@@ -1443,7 +1443,7 @@ static HWND PruneDestroyedAndPickAnchor(HWND deadHwnd) {
   return anchor;
 }
 
-// used as helper of HandleTrivialState()
+// Helper for HandleTrivialState()
 static void EraseState(const DesktopMonitorKey & key){
   AcquireSRWLockExclusive(&g_tilingStateLock);
   g_tilingStateMap.erase(key);
@@ -1550,11 +1550,11 @@ void RetileFromResize(HWND hwnd) {
 
   }
 
-  // checks for dead state
+  // Handle empty/single-window states
   if (HandleTrivialState(key, state, workArea)) return;
 
-  // Un-tile functionality
-  // Compares cached window states 
+  // Window-movement-based un-tiling
+  // (compares cached window states)
   AcquireSRWLockExclusive(&g_moveSizeRectsLock);
   auto itStart = g_moveSizeStartRects.find(hwnd);
   if (itStart != g_moveSizeStartRects.end()) {
@@ -1612,7 +1612,7 @@ void RetileFromResize(HWND hwnd) {
   if (HandleTrivialState(key, state, workArea)) return;
 
 
-  //Start looping over state to place all windows
+  // Loop over state to place all windows
   for (auto itWin = state.windows.begin(); itWin != state.windows.end(); ) {
       HWND w = *itWin;
 
@@ -1894,8 +1894,6 @@ void CALLBACK WinEventProc(HWINEVENTHOOK, DWORD event, HWND hwnd, LONG idObject,
   }
 
   
-  //Wh_Log(L"Winevent Catched");
-
   const bool tracked = IsWindowTrackedInAnyState(hwnd);
 
   // Cache start/end rects for move/size events.
@@ -1942,8 +1940,7 @@ void CALLBACK WinEventProc(HWINEVENTHOOK, DWORD event, HWND hwnd, LONG idObject,
   }
 
   if (g_enableTileNewWin && event == EVENT_SYSTEM_MINIMIZEEND) {
-    //RequestTileWindows();
-    
+
     if (!tracked && CouldBeTileEligible(hwnd)) {
       RequestTileWindows();
     }
@@ -2156,7 +2153,7 @@ DWORD WINAPI HotkeyThreadProc(LPVOID) {
           HWND anchor = PruneDestroyedAndPickAnchor(dead);
           if (anchor) RetileFromResize(anchor);
 
-          InterlockedExchange(&g_retileInProgress, 0); // isn't this redundant
+          InterlockedExchange(&g_retileInProgress, 0); // potentially redundant
           continue;
         }
         if (msg.message == WM_HOTKEY) {
