@@ -53,8 +53,12 @@ resize-adjusted ratios per virtual desktop.
   $description: Enable hotkey to tile windows on current monitor
 
 - EnableTileNewWin: false
-  $name: '[Tiling] Tile New Windows'
+  $name: '[Tiling] Full-auto Tiling'
   $description: Automatically retile when a new window is created (only applies when tiling is enabled)
+
+- TileNewWinToggleKey: "U"
+  $name: '[Tiling] Tile New Windows Toggle Key'
+  $description: 'Key to pause/resume Auto-tiling at runtime.'
 
 - EnableResizeRetile: true
   $name: '[Tiling] Retile On Resize'
@@ -215,10 +219,12 @@ enum HotkeyIds {
   HK_TILE = 1,
   HK_LAYOUT = 2,
   HK_RETILE_TOGGLE = 3,
-  HK_SWAP_MASTER = 4
+  HK_SWAP_MASTER = 4, 
+  HK_TILENEWWIN_TOGGLE = 5,
 };
 
 // Messages to hotkey thread
+constexpr UINT WM_APP_RETILE_ON_RESIZE = WM_APP + 1;
 constexpr UINT WM_APP_TILE = WM_APP + 2;
 constexpr UINT WM_APP_PRUNE_DESTROY = WM_APP + 3;
 
@@ -227,6 +233,7 @@ static UINT g_tileKey = 'D';
 static UINT g_layoutKey = 'L';
 static UINT g_retileToggleKey = 'R';
 static UINT g_swapMasterKey = 'M';
+static UINT g_tileNewWinToggleKey = 'U';
 
 static LONG g_tileMargin = 4;
 static LONG g_tileGap = 4;
@@ -241,6 +248,7 @@ static bool g_captureLayoutOnTile = true;
 static bool g_enableLayoutCycle = true;
 static bool g_retileSuspended = false;
 static bool g_enableTileNewWin = false;
+static bool g_tileNewWinSuspended = false;
 
 // Per-desktop + monitor state
 struct GuidHash {
@@ -1510,8 +1518,6 @@ void RetileFromResize(HWND hwnd) {
       HWND resolved = ResolveToTiledWindow(resizedHwnd, state.windows);
       if (resolved) {
         resizedHwnd = resolved; 
-        // (intentional) early return to not handle windows from another desktop
-        return;
 
       } else {
         Wh_Log(L"Unresolved window");
@@ -1842,7 +1848,8 @@ void OnWindowResizeEnd(HWND hwnd) {
     return;
   }
 
-  if (!PostThreadMessage(g_threadId, WM_APP + 1, reinterpret_cast<WPARAM>(hwnd), 0)) {
+  if (!PostThreadMessage(g_threadId, WM_APP_RETILE_ON_RESIZE, 
+                        reinterpret_cast<WPARAM>(hwnd), 0)) {
     InterlockedExchange(&g_retileInProgress, 0);
   }
 }
@@ -1894,11 +1901,13 @@ void CALLBACK WinEventProc(HWINEVENTHOOK, DWORD event, HWND hwnd, LONG idObject,
 
   
   const bool tracked = IsWindowTrackedInAnyState(hwnd);
+  const bool tileNewWinNowActive = g_enableTileNewWin && !g_tileNewWinSuspended;
 
   // Cache start/end rects for move/size events.
   if (event == EVENT_SYSTEM_MOVESIZESTART || event == EVENT_SYSTEM_MOVESIZEEND) {
     if (!tracked) return;
-    if (!g_enableTileNewWin) {
+    // drag-untile should come back with auto-tile temporarily disabled
+    if (!tileNewWinNowActive) {
         AcquireSRWLockExclusive(&g_moveSizeRectsLock);
 
         RECT r{};
@@ -1938,24 +1947,29 @@ void CALLBACK WinEventProc(HWINEVENTHOOK, DWORD event, HWND hwnd, LONG idObject,
     return;
   }
 
-  if (g_enableTileNewWin && event == EVENT_SYSTEM_MINIMIZEEND) {
+  // two AutoTile comparisons
+  if (tileNewWinNowActive) {
 
-    if (!tracked && CouldBeTileEligible(hwnd)) {
-      RequestTileWindows();
-    }
-    return;
-  }
+    if (event == EVENT_SYSTEM_MINIMIZEEND) {
 
-  // Handle window creation / restoration (TileNewWin)
-  // SHOW: Win32
-  // UNCLOAKED: UWP ApplicationFrameWindow
-  if (g_enableTileNewWin
-      && (event == EVENT_OBJECT_SHOW || event == EVENT_OBJECT_UNCLOAKED)) {
-    if (!tracked && CouldBeTileEligible(hwnd)) {
-      RequestTileWindows();
+      if (!tracked && CouldBeTileEligible(hwnd)) {
+        RequestTileWindows();
+      }
+      return;
     }
-    
-    return;
+
+    // Handle window creation / restoration (TileNewWin)
+    // SHOW: Win32
+    // UNCLOAKED: UWP ApplicationFrameWindow
+    if (event == EVENT_OBJECT_SHOW || 
+        event == EVENT_OBJECT_UNCLOAKED) {
+      if (!tracked && CouldBeTileEligible(hwnd)) {
+        RequestTileWindows();
+      }
+      
+      return;
+    }
+
   }
 }
 
@@ -2083,12 +2097,14 @@ void LoadSettings() {
   // New! 
   g_enableTileNewWin = Wh_GetIntSetting(L"EnableTileNewWin") != 0;
   g_retileSuspended = false;
+  g_tileNewWinSuspended = false;
 
 
   g_tileKey = ReadStringSetting(L"TileKey", ParseSingleCharKey, (UINT)'D');
   g_layoutKey = ReadStringSetting(L"LayoutKey", ParseSingleCharKey, (UINT)'L');
   g_retileToggleKey = ReadStringSetting(L"RetileToggleKey", ParseSingleCharKey, (UINT)'R');
   g_swapMasterKey = ReadStringSetting(L"SwapMasterKey", ParseSingleCharKey, (UINT)'M');
+  g_tileNewWinToggleKey = ReadStringSetting(L"TileNewWinToggleKey", ParseSingleCharKey, (UINT)'U');
 }
 
 DWORD WINAPI HotkeyThreadProc(LPVOID) {
@@ -2109,6 +2125,7 @@ DWORD WINAPI HotkeyThreadProc(LPVOID) {
   if (g_enableTiling) {
     RegisterHotKey(nullptr, HK_TILE, g_tilingModifiers, g_tileKey);
     RegisterHotKey(nullptr, HK_SWAP_MASTER, g_tilingModifiers, g_swapMasterKey);
+    RegisterHotKey(nullptr, HK_TILENEWWIN_TOGGLE, g_tilingModifiers, g_tileNewWinToggleKey);
     if (g_enableLayoutCycle) {
       RegisterHotKey(nullptr, HK_LAYOUT, g_tilingModifiers, g_layoutKey);
     }
@@ -2132,61 +2149,90 @@ DWORD WINAPI HotkeyThreadProc(LPVOID) {
 
     if (waitResult == WAIT_OBJECT_0) {
       while (PeekMessage(&msg, nullptr, 0, 0, PM_REMOVE)) {
-        if (msg.message == WM_QUIT) {
-          goto cleanup;
-        }
-        if (msg.message == WM_APP + 1) {
-          HWND resizedHwnd = reinterpret_cast<HWND>(msg.wParam);
-          RetileFromResize(resizedHwnd);
-          InterlockedExchange(&g_retileInProgress, 0);
-          continue;
-        }
-        if (msg.message == WM_APP_TILE) {
-          TileWindows();
-          InterlockedExchange(&g_retileInProgress, 0);
-          continue;
-        }
-        if (msg.message == WM_APP_PRUNE_DESTROY) {
-          HWND dead = (HWND)msg.wParam;
-          
-          HWND anchor = PruneDestroyedAndPickAnchor(dead);
-          if (anchor) RetileFromResize(anchor);
 
-          InterlockedExchange(&g_retileInProgress, 0); // potentially redundant
-          continue;
-        }
-        if (msg.message == WM_HOTKEY) {
-          UINT hotkeyId = static_cast<UINT>(msg.wParam);
-          if (hotkeyId == HK_TILE) {
-              if (InterlockedCompareExchange(&g_retileInProgress, 1, 0) == 0) {
-                TileWindows();
-                InterlockedExchange(&g_retileInProgress, 0);
-              }
-              continue;
-          }
-          if (hotkeyId == HK_LAYOUT) {
-            g_currentLayout =
-                static_cast<TileLayout>((static_cast<int>(g_currentLayout) + 1) % static_cast<int>(TileLayout::COUNT));
-              if (InterlockedCompareExchange(&g_retileInProgress, 1, 0) == 0) {
-                TileWindows();
-                InterlockedExchange(&g_retileInProgress, 0);
-              }
-              continue;
-          }
-          if (hotkeyId == HK_SWAP_MASTER) {
-            SwapMaster();
+        switch (msg.message) {  
+          case WM_QUIT: 
+            goto cleanup;
+          
+          case WM_APP_RETILE_ON_RESIZE: {
+            HWND resizedHwnd = reinterpret_cast<HWND>(msg.wParam);
+            RetileFromResize(resizedHwnd);
+            InterlockedExchange(&g_retileInProgress, 0);
             continue;
           }
-          if (hotkeyId == HK_RETILE_TOGGLE && g_enableResizeRetile) {
-            g_retileSuspended = !g_retileSuspended;
-            if (g_retileSuspended) {
-              RemoveWinEventHooks();
-              InterlockedExchange(&g_retileInProgress, 0);
-              ResetTilingStateMemory();
-              Wh_Log(L"Retile-on-resize suspended; tiling memory reset");
-            } else {
-              InstallWinEventHooks();
-              Wh_Log(L"Retile-on-resize resumed");
+
+          case WM_APP_TILE: {
+            TileWindows();
+            InterlockedExchange(&g_retileInProgress, 0);
+            continue;
+          }
+
+          case WM_APP_PRUNE_DESTROY: {
+            HWND dead = (HWND)msg.wParam;
+            HWND anchor = PruneDestroyedAndPickAnchor(dead);
+            if (anchor) RetileFromResize(anchor);
+            InterlockedExchange(&g_retileInProgress, 0); // potentially redundant
+            continue;
+          }
+
+          case WM_HOTKEY: {
+            UINT hotkeyId = static_cast<UINT>(msg.wParam);
+            switch (hotkeyId) {
+              case HK_TILE: {
+                  if (InterlockedCompareExchange(&g_retileInProgress, 1, 0) == 0) {
+                    TileWindows();
+                    InterlockedExchange(&g_retileInProgress, 0);
+                  }
+                  continue;
+              }
+
+              case HK_LAYOUT: {
+                g_currentLayout =
+                    static_cast<TileLayout>((static_cast<int>(g_currentLayout) + 1) % static_cast<int>(TileLayout::COUNT));
+                  if (InterlockedCompareExchange(&g_retileInProgress, 1, 0) == 0) {
+                    TileWindows();
+                    InterlockedExchange(&g_retileInProgress, 0);
+                  }
+                  continue;
+              }
+
+              case HK_SWAP_MASTER: {
+                SwapMaster();
+                continue;
+              }
+
+              case HK_TILENEWWIN_TOGGLE: {
+                if (g_enableTileNewWin) {
+                  g_tileNewWinSuspended = !g_tileNewWinSuspended;
+                  Wh_Log(L"TileNewWin %s", g_tileNewWinSuspended ? L"suspended" : L"resumed");
+                  
+                  // Saves a hotkey press after resume
+                  if (!g_tileNewWinSuspended) {
+                    if (InterlockedCompareExchange(&g_retileInProgress, 1, 0) == 0) {
+                      TileWindows();
+                      InterlockedExchange(&g_retileInProgress, 0);
+                    }
+                  }
+                  continue;
+                };
+                Wh_Log(L"TileNewWin is disabled from settings. ");
+                continue;
+              }
+
+              case HK_RETILE_TOGGLE:
+                if (g_enableResizeRetile) {
+                  g_retileSuspended = !g_retileSuspended;
+                  if (g_retileSuspended) {
+                    RemoveWinEventHooks();
+                    InterlockedExchange(&g_retileInProgress, 0);
+                    ResetTilingStateMemory();
+                    Wh_Log(L"Retile-on-resize suspended; tiling memory reset");
+                  } else {
+                    InstallWinEventHooks();
+                    Wh_Log(L"Retile-on-resize resumed");
+                  } 
+                }
+                continue;
             }
             continue;
           }
@@ -2199,6 +2245,7 @@ cleanup:
   if (g_enableTiling) {
     UnregisterHotKey(nullptr, HK_TILE);
     UnregisterHotKey(nullptr, HK_SWAP_MASTER);
+    UnregisterHotKey(nullptr, HK_TILENEWWIN_TOGGLE);
     if (g_enableLayoutCycle) {
       UnregisterHotKey(nullptr, HK_LAYOUT);
     }
