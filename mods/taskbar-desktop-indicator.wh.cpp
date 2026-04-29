@@ -2,7 +2,7 @@
 // @id              taskbar-desktop-indicator
 // @name            Taskbar Desktop Indicator
 // @description     Displays the current virtual desktop as a number or marker in the Windows 11 taskbar clock area
-// @version         1.2.1
+// @version         1.2.2
 // @author          Simon Benedict
 // @github          https://github.com/simon-ami
 // @include         explorer.exe
@@ -244,7 +244,7 @@ struct VirtualDesktopNotificationObject {
 WinVersion g_winVersion = WinVersion::Unsupported;
 WORD g_explorerBuildNumber = 0;
 WORD g_explorerRevisionNumber = 0;
-std::atomic<bool> g_taskbarViewDllLoaded = false;
+std::atomic<bool> g_systemTrayModuleHooked = false;
 std::atomic<bool> g_unloading = false;
 std::atomic<int> g_currentDesktopNumber = 1;
 std::atomic<int> g_pollIntervalMs = 0;
@@ -2043,8 +2043,24 @@ HRESULT WINAPI BadgeIconContent_get_ViewModel_Hook(LPVOID pThis, LPVOID pArgs) {
     return hr;
 }
 
-HMODULE GetTaskbarViewModuleHandle() {
-    HMODULE module = GetModuleHandleW(L"Taskbar.View.dll");
+HMODULE GetSystemTrayModuleHandle() {
+    HMODULE module = GetModuleHandleW(L"SystemTray.dll");
+
+    if (!module) {
+        module = GetModuleHandleW(L"Taskbar.View.dll");
+        // First known Taskbar.View.dll version without SystemTray symbols:
+        // 2604.8002.200.6000.
+        if (module) {
+            VS_FIXEDFILEINFO* fixedFileInfo = GetModuleVersionInfo(module, nullptr);
+            WORD moduleMajor =
+                fixedFileInfo ? HIWORD(fixedFileInfo->dwFileVersionMS) : 0;
+
+            if (!moduleMajor || moduleMajor >= 2604) {
+                Wh_Log(L"Skipping Taskbar.View.dll version %d", moduleMajor);
+                module = nullptr;
+            }
+        }
+    }
     if (!module) {
         module = GetModuleHandleW(L"ExplorerExtensions.dll");
     }
@@ -2052,9 +2068,9 @@ HMODULE GetTaskbarViewModuleHandle() {
     return module;
 }
 
-bool HookTaskbarViewDllSymbols(HMODULE module) {
-    // Taskbar.View.dll, ExplorerExtensions.dll
-    WindhawkUtils::SYMBOL_HOOK taskbarViewHooks[] = {
+bool HookSystemTraySymbols(HMODULE module) {
+    // SystemTray.dll, Taskbar.View.dll, ExplorerExtensions.dll
+    WindhawkUtils::SYMBOL_HOOK systemTrayHooks[] = {
         {
             {LR"(private: void __cdecl winrt::SystemTray::implementation::ClockSystemTrayIconDataModel::RefreshIcon(class SystemTrayTelemetry::ClockUpdate &))"},
             &ClockSystemTrayIconDataModel_RefreshIcon_Original,
@@ -2080,7 +2096,7 @@ bool HookTaskbarViewDllSymbols(HMODULE module) {
         },
     };
 
-    if (!HookSymbols(module, taskbarViewHooks, ARRAYSIZE(taskbarViewHooks))) {
+    if (!HookSymbols(module, systemTrayHooks, ARRAYSIZE(systemTrayHooks))) {
         Wh_Log(L"HookSymbols failed");
         return false;
     }
@@ -2212,15 +2228,21 @@ void RefreshLiveTaskbarClock() {
         reinterpret_cast<LPARAM>(&enumWindowsProc));
 }
 
-void HandleLoadedModuleIfTaskbarView(HMODULE module, LPCWSTR moduleName) {
-    if (g_winVersion >= WinVersion::Win11 && !g_taskbarViewDllLoaded &&
-        GetTaskbarViewModuleHandle() == module &&
-        !g_taskbarViewDllLoaded.exchange(true)) {
-        Wh_Log(L"Loaded %s", moduleName);
-        if (HookTaskbarViewDllSymbols(module)) {
-            Wh_ApplyHookOperations();
-            RefreshLiveTaskbarClock();
-        }
+void HandleLoadedModuleIfSystemTray(HMODULE module, LPCWSTR moduleName) {
+    if (g_winVersion < WinVersion::Win11 || g_systemTrayModuleHooked) {
+        return;
+    }
+
+    if (GetSystemTrayModuleHandle() != module) {
+        return;
+    }
+
+    Wh_Log(L"Loaded %s", moduleName);
+
+    if (HookSystemTraySymbols(module)) {
+        g_systemTrayModuleHooked = true;
+        Wh_ApplyHookOperations();
+        RefreshLiveTaskbarClock();
     }
 }
 
@@ -2232,7 +2254,7 @@ HMODULE WINAPI LoadLibraryExW_Hook(LPCWSTR libFileName,
                                    DWORD flags) {
     HMODULE module = LoadLibraryExW_Original(libFileName, file, flags);
     if (module) {
-        HandleLoadedModuleIfTaskbarView(module, libFileName);
+        HandleLoadedModuleIfSystemTray(module, libFileName);
     }
 
     return module;
@@ -2318,11 +2340,14 @@ BOOL Wh_ModInit() {
 
     HookExplorerExeSymbols();
 
-    if (HMODULE taskbarViewModule = GetTaskbarViewModuleHandle()) {
-        g_taskbarViewDllLoaded = true;
-        if (!HookTaskbarViewDllSymbols(taskbarViewModule)) {
-            return FALSE;
+    if (HMODULE systemTrayModule = GetSystemTrayModuleHandle()) {
+        if (HookSystemTraySymbols(systemTrayModule)) {
+            g_systemTrayModuleHooked = true;
+        } else {
+            Wh_Log(L"System tray symbols not found in initial module");
         }
+    } else {
+        Wh_Log(L"System tray module not loaded yet");
     }
 
     HMODULE kernelBaseModule = GetModuleHandleW(L"kernelbase.dll");
@@ -2348,12 +2373,14 @@ void Wh_ModSettingsChanged() {
 }
 
 void Wh_ModAfterInit() {
-    if (g_winVersion >= WinVersion::Win11 && !g_taskbarViewDllLoaded) {
-        if (HMODULE taskbarViewModule = GetTaskbarViewModuleHandle()) {
-            if (!g_taskbarViewDllLoaded.exchange(true) &&
-                HookTaskbarViewDllSymbols(taskbarViewModule)) {
-                Wh_ApplyHookOperations();
-            }
+    if (g_winVersion < WinVersion::Win11 || g_systemTrayModuleHooked) {
+        return;
+    }
+
+    if (HMODULE systemTrayModule = GetSystemTrayModuleHandle()) {
+        if (HookSystemTraySymbols(systemTrayModule)) {
+            g_systemTrayModuleHooked = true;
+            Wh_ApplyHookOperations();
         }
     }
 
